@@ -16,7 +16,7 @@ from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import (
 )
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
-from xtuner.v1.rl.rollout.chat_template import canonicalize_messages_for_chat_template
+from xtuner.v1.rl.rollout.chat_template import apply_chat_template_with_system_fallback
 from xtuner.v1.rl.rollout.trace_store import get_store
 from xtuner.v1.rl.utils import create_task
 
@@ -235,8 +235,9 @@ class AgentInLocalhostLoop(AgentLoop):
             return
 
         segment = item.artifacts["messages"][-1]
-        text = self.tokenizer.apply_chat_template(
-            canonicalize_messages_for_chat_template(segment["messages"]),
+        text = apply_chat_template_with_system_fallback(
+            self.tokenizer,
+            segment["messages"],
             tools=segment["tools"],
             tokenize=False,
             add_generation_prompt=False,
