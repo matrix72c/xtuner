@@ -16,11 +16,16 @@ def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
     mutate model responses returned to the agent/client, nor the generated
     token ids, labels, or raw rollout artifacts used for training.
 
+    Late system turns are merged into one leading system message for templates
+    that only accept a system message at the beginning. In addition,
     ``tool_calls[].function.arguments`` strings are parsed to dicts so the
     template's ``tojson`` filter sees a real object.
     """
 
     messages = copy.deepcopy(messages)
+    if any(message["role"] == "system" for message in messages[1:]):
+        messages = _merge_system_messages_at_front(messages)
+
     for message in messages:
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -53,6 +58,22 @@ def canonicalize_tool_arguments(arguments: Any) -> dict[str, Any]:
     if isinstance(parsed, dict):
         return parsed
     return {_RAW_ARGUMENTS_KEY: arguments}
+
+
+def _merge_system_messages_at_front(messages: list[dict]) -> list[dict]:
+    system_parts: list[str] = []
+    other_messages: list[dict] = []
+    for message in messages:
+        if message["role"] != "system":
+            other_messages.append(message)
+            continue
+
+        content = message["content"]
+        if isinstance(content, list):
+            content = "".join(block["text"] for block in content)
+        system_parts.append(content)
+
+    return [{"role": "system", "content": "\n\n".join(system_parts)}, *other_messages]
 
 
 def _loads_partial_json_object(raw: str) -> dict[str, Any] | None:
