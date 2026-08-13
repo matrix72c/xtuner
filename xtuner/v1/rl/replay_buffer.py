@@ -19,6 +19,7 @@ from xtuner.v1.data_proto.rl_data import (
     reset_rollout_response,
     update_sample_version,
 )
+from xtuner.v1.rl.rollout.trace_store import release_existing_sessions
 from xtuner.v1.rl.utils import (
     BetweenNode,
     ConditionNode,
@@ -451,9 +452,15 @@ class ReplayBuffer:
         self._storage = storage_backend
         self._lock = asyncio.Lock()
 
-    def _cleanup_expired_group(self, group: list[RolloutState], *, retryable: bool) -> None:
+    async def _cleanup_expired_group(self, group: list[RolloutState], *, retryable: bool) -> None:
         """Release stale state according to whether the group can be
         retried."""
+
+        released_session_ids = set()
+        if not retryable:
+            released_session_ids = await release_existing_sessions(
+                [str(item.session_id) for item in group if item.session_id is not None]
+            )
 
         for item in group:
             if retryable:
@@ -463,6 +470,9 @@ class ReplayBuffer:
             else:
                 # No consumer can retry this terminal group. Release all optional
                 # state before dropping the group's final strong references.
+                if item.session_id is not None and str(item.session_id) in released_session_ids:
+                    # TraceStore.release_sessions() already freed these routed-expert refs.
+                    item.routed_experts = None
                 discard_rollout_state(item)
             item.status = Status.EXPIRED
 
@@ -489,7 +499,7 @@ class ReplayBuffer:
         status = get_group_status(items)
         staleness = max(item.seq_staleness for item in items)
         if status == Status.EXPIRED:
-            self._cleanup_expired_group(items, retryable=expired_groups_retryable)
+            await self._cleanup_expired_group(items, retryable=expired_groups_retryable)
             if not expired_groups_retryable:
                 return
         storage_item = StorageItem(
@@ -549,7 +559,7 @@ class ReplayBuffer:
                     should_expire = any(getattr(item, "seq_staleness", 0) >= stale_threshold for item in record.item)
                     if should_expire:
                         retryable = retryable_by_task.get(task_name, True)
-                        self._cleanup_expired_group(record.item, retryable=retryable)
+                        await self._cleanup_expired_group(record.item, retryable=retryable)
                         status = Status.EXPIRED
                         expired_count += 1
                         if not retryable:
