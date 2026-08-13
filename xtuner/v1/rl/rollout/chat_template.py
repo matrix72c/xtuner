@@ -2,39 +2,8 @@ import copy
 import json
 from typing import Any
 
-from jinja2.exceptions import TemplateError
-
 
 _RAW_ARGUMENTS_KEY = "__xtuner_raw_arguments__"
-_SYSTEM_MESSAGE_POSITION_ERROR = "System message must be at the beginning."
-
-
-def apply_chat_template_with_system_fallback(tokenizer: Any, messages: list[dict], **kwargs: Any) -> Any:
-    """Apply a chat template with a narrow fallback for late system turns.
-
-    The original message order is always rendered first. If, and only if, the
-    template rejects a misplaced system turn with Qwen's known error, all
-    textual system turns are merged into one leading turn and rendering is
-    retried. Permissive templates therefore retain their native behavior.
-
-    Args:
-        tokenizer: Tokenizer or processor exposing ``apply_chat_template``.
-        messages: OpenAI-style chat messages.
-        **kwargs: Arguments forwarded unchanged to ``apply_chat_template``.
-
-    Returns:
-        The value returned by ``tokenizer.apply_chat_template``.
-    """
-
-    canonical_messages = canonicalize_messages_for_chat_template(messages)
-    try:
-        return tokenizer.apply_chat_template(canonical_messages, **kwargs)
-    except TemplateError as exc:
-        if str(exc) != _SYSTEM_MESSAGE_POSITION_ERROR or not _has_late_system_message(canonical_messages):
-            raise
-
-    normalized_messages = _merge_system_messages_at_front(canonical_messages)
-    return tokenizer.apply_chat_template(normalized_messages, **kwargs)
 
 
 def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
@@ -47,11 +16,16 @@ def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
     mutate model responses returned to the agent/client, nor the generated
     token ids, labels, or raw rollout artifacts used for training.
 
+    Late system turns are merged into one leading system message for templates
+    that only accept a system message at the beginning. In addition,
     ``tool_calls[].function.arguments`` strings are parsed to dicts so the
     template's ``tojson`` filter sees a real object.
     """
 
     messages = copy.deepcopy(messages)
+    if any(message["role"] == "system" for message in messages[1:]):
+        messages = _merge_system_messages_at_front(messages)
+
     for message in messages:
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -86,34 +60,20 @@ def canonicalize_tool_arguments(arguments: Any) -> dict[str, Any]:
     return {_RAW_ARGUMENTS_KEY: arguments}
 
 
-def _has_late_system_message(messages: list[dict]) -> bool:
-    return any(message.get("role") == "system" for message in messages[1:])
-
-
 def _merge_system_messages_at_front(messages: list[dict]) -> list[dict]:
     system_parts: list[str] = []
-    non_system_messages: list[dict] = []
-
+    other_messages: list[dict] = []
     for message in messages:
-        if message.get("role") != "system":
-            non_system_messages.append(message)
+        if message["role"] != "system":
+            other_messages.append(message)
             continue
 
-        content = message.get("content", "")
-        if isinstance(content, str):
-            system_parts.append(content)
-            continue
+        content = message["content"]
         if isinstance(content, list):
-            text_parts: list[str] = []
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "text":
-                    raise ValueError("System messages may contain only text blocks")
-                text_parts.append(str(block.get("text", "")))
-            system_parts.append("".join(text_parts))
-            continue
-        raise ValueError(f"Unsupported system message content: {type(content).__name__}")
+            content = "".join(block["text"] for block in content)
+        system_parts.append(content)
 
-    return [{"role": "system", "content": "\n\n".join(system_parts)}, *non_system_messages]
+    return [{"role": "system", "content": "\n\n".join(system_parts)}, *other_messages]
 
 
 def _loads_partial_json_object(raw: str) -> dict[str, Any] | None:

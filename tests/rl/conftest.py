@@ -27,7 +27,6 @@ _LIGHTWEIGHT_TEST_FILES = {
     "test_rl_colocate_trainer.py",
     "test_rl_disaggregated_trainer.py",
     "test_rollout_config_dist_port_base_patch.py",
-    "test_rollout_chat_template.py",
     "test_rollout_logic.py",
     "test_single_turn_agent_loop.py",
     "test_staleness_policy.py",
@@ -50,7 +49,8 @@ def _pytest_invocation_paths() -> list[Path]:
 def _should_install_import_stubs() -> bool:
     paths = _pytest_invocation_paths()
     return bool(paths) and all(
-        path.is_file() and path.parent == _RL_TEST_DIR and path.name in _LIGHTWEIGHT_TEST_FILES for path in paths
+        path.is_file() and path.parent == _RL_TEST_DIR and path.name in _LIGHTWEIGHT_TEST_FILES
+        for path in paths
     )
 
 
@@ -58,22 +58,6 @@ def _new_module(name: str) -> types.ModuleType:
     module = types.ModuleType(name)
     module.__dict__.setdefault("__all__", [])
     return module
-
-
-def _install_chat_template_package_stubs() -> None:
-    """Load the pure chat-template helper without importing the RL runtime."""
-
-    repo_dir = _RL_TEST_DIR.parents[1]
-    package_paths = {
-        "xtuner": repo_dir / "xtuner",
-        "xtuner.v1": repo_dir / "xtuner" / "v1",
-        "xtuner.v1.rl": repo_dir / "xtuner" / "v1" / "rl",
-        "xtuner.v1.rl.rollout": repo_dir / "xtuner" / "v1" / "rl" / "rollout",
-    }
-    for name, path in package_paths.items():
-        module = _new_module(name)
-        module.__path__ = [str(path)]
-        sys.modules.setdefault(name, module)
 
 
 def _install_dataset_stubs() -> None:
@@ -197,10 +181,6 @@ def _install_rl_trainer_worker_stubs() -> None:
 # These stubs are only safe for isolated lightweight runs. Full RL collection
 # also imports real training tests, which require the real modules.
 if _should_install_import_stubs():
-    invocation_names = {path.name for path in _pytest_invocation_paths()}
-    if invocation_names == {"test_rollout_chat_template.py"}:
-        _install_chat_template_package_stubs()
-    else:
-        _install_dataset_stubs()
-        _install_train_trainer_stub()
-        _install_rl_trainer_worker_stubs()
+    _install_dataset_stubs()
+    _install_train_trainer_stub()
+    _install_rl_trainer_worker_stubs()

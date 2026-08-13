@@ -12,7 +12,7 @@ from aiohttp import ClientConnectionResetError, ClientSession, ClientTimeout, we
 from transformers import AutoTokenizer
 from xtuner.v1.utils import get_logger
 
-from .chat_template import apply_chat_template_with_system_fallback
+from .chat_template import canonicalize_messages_for_chat_template
 from .trace_store import TokenizedSegment, get_store
 
 
@@ -331,9 +331,8 @@ class SessionServer:
             if isinstance(msg, dict) and "content" in msg:
                 msg["content"], _ = _strip_stop_word(msg["content"], self.stop_word)
 
-        prompt_text = apply_chat_template_with_system_fallback(
-            self.tokenizer,
-            openai_messages,
+        prompt_text = self.tokenizer.apply_chat_template(
+            canonicalize_messages_for_chat_template(openai_messages),
             tools=openai_tools,
             add_generation_prompt=True,
             tokenize=False,
@@ -425,8 +424,8 @@ class SessionServer:
                 msg["content"], _ = _strip_stop_word(msg["content"], self.stop_word)
 
         # Render OpenAI prompts for the prefix-cache key boundary.
-        old_prompt = apply_chat_template_with_system_fallback(
-            self.tokenizer, messages, tools=tools, add_generation_prompt=True, tokenize=False
+        old_prompt = self.tokenizer.apply_chat_template(
+            canonicalize_messages_for_chat_template(messages), tools=tools, add_generation_prompt=True, tokenize=False
         )
         if output_token_ids is None:
             raise RuntimeError(
@@ -436,9 +435,8 @@ class SessionServer:
 
         full_messages = [*messages, assistant_msg]
         new_prompt = (
-            apply_chat_template_with_system_fallback(
-                self.tokenizer,
-                full_messages,
+            self.tokenizer.apply_chat_template(
+                canonicalize_messages_for_chat_template(full_messages),
                 tools=tools,
                 add_generation_prompt=False,
                 tokenize=False,

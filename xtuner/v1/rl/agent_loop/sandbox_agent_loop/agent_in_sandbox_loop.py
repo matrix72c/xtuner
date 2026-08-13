@@ -15,7 +15,7 @@ from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.utils import create_task
 
-from ...rollout.chat_template import apply_chat_template_with_system_fallback
+from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
 from ..agent_loop import AgentLoop, AgentLoopConfig
 from .schemas import AgentRolloutItem, RolloutStatus
@@ -303,9 +303,8 @@ class AgentInSandboxLoop(AgentLoop):
             segment_state.extra_fields["agent_trace_segment_count"] = len(segments)
             segment_state.extra_fields["agent_session_id"] = rollout_state.session_id
 
-            text = apply_chat_template_with_system_fallback(
-                self.tokenizer,
-                messages,
+            text = self.tokenizer.apply_chat_template(
+                canonicalize_messages_for_chat_template(messages),
                 tools=tools,
                 tokenize=False,
                 add_generation_prompt=False,
