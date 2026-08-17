@@ -452,29 +452,29 @@ class ReplayBuffer:
         self._storage = storage_backend
         self._lock = asyncio.Lock()
 
-    async def _cleanup_expired_group(self, group: list[RolloutState], *, retryable: bool) -> None:
-        """Release stale state according to whether the group can be
-        retried."""
-
-        released_session_ids = set()
-        if not retryable:
-            released_session_ids = await release_existing_sessions(
-                [str(item.session_id) for item in group if item.session_id is not None]
-            )
-
+    @staticmethod
+    def _reset_retryable_expired_group(group: list[RolloutState]) -> None:
+        """Keep rerollout inputs while dropping a stale response."""
         for item in group:
-            if retryable:
-                # Tail batch may reroll this sample. Keep prompt and multimodal
-                # training inputs, but release the stale response and routed experts.
-                reset_rollout_response(item)
-            else:
-                # No consumer can retry this terminal group. Release all optional
-                # state before dropping the group's final strong references.
+            reset_rollout_response(item)
+            item.status = Status.EXPIRED
+
+    @staticmethod
+    async def _discard_terminal_expired_groups(groups: list[list[RolloutState]]) -> None:
+        """Release terminal trace sessions in one RPC, then discard groups."""
+        if not groups:
+            return
+
+        released_session_ids = await release_existing_sessions(
+            [str(item.session_id) for group in groups for item in group if item.session_id is not None]
+        )
+        for group in groups:
+            for item in group:
                 if item.session_id is not None and str(item.session_id) in released_session_ids:
                     # TraceStore.release_sessions() already freed these routed-expert refs.
                     item.routed_experts = None
                 discard_rollout_state(item)
-            item.status = Status.EXPIRED
+                item.status = Status.EXPIRED
 
     async def put(
         self,
@@ -499,8 +499,10 @@ class ReplayBuffer:
         status = get_group_status(items)
         staleness = max(item.seq_staleness for item in items)
         if status == Status.EXPIRED:
-            await self._cleanup_expired_group(items, retryable=expired_groups_retryable)
-            if not expired_groups_retryable:
+            if expired_groups_retryable:
+                self._reset_retryable_expired_group(items)
+            else:
+                await self._discard_terminal_expired_groups([items])
                 return
         storage_item = StorageItem(
             item=items,
@@ -541,6 +543,7 @@ class ReplayBuffer:
             statuses = [Status.COMPLETED, Status.ABORTED]
         expired_counts: dict[str, int] = {}
         retryable_by_task = expired_groups_retryable_by_task or {}
+        terminal_expired_groups: list[list[RolloutState]] = []
         async with self._lock:
             updated_records: list[StorageItem] = []
             deleted_uids: list[int] = []
@@ -559,10 +562,12 @@ class ReplayBuffer:
                     should_expire = any(getattr(item, "seq_staleness", 0) >= stale_threshold for item in record.item)
                     if should_expire:
                         retryable = retryable_by_task.get(task_name, True)
-                        await self._cleanup_expired_group(record.item, retryable=retryable)
                         status = Status.EXPIRED
                         expired_count += 1
-                        if not retryable:
+                        if retryable:
+                            self._reset_retryable_expired_group(record.item)
+                        else:
+                            terminal_expired_groups.append(record.item)
                             deleted_uids.append(record.uid)
                             continue
                     else:
@@ -571,6 +576,7 @@ class ReplayBuffer:
                 expired_counts[task_name] = expired_count
             await self._storage.delete(deleted_uids)
             await self._storage.update(updated_records)
+        await self._discard_terminal_expired_groups(terminal_expired_groups)
         return expired_counts
 
     async def is_ready(
