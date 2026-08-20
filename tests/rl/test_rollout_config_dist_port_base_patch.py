@@ -27,6 +27,14 @@ def test_rollout_config_default_dist_port_base_is_staggered(monkeypatch):
     assert third.dist_port_base == base + 48
 
 
+def test_rollout_config_disables_prefix_caching_by_default():
+    assert _build_rollout_config().enable_prefix_caching is False
+
+
+def test_rollout_config_accepts_prefix_caching_opt_in():
+    assert _build_rollout_config(enable_prefix_caching=True).enable_prefix_caching is True
+
+
 def test_rollout_config_warns_for_deprecated_allow_over_concurrency_ratio(monkeypatch):
     monkeypatch.delenv("XTUNER_USE_SGLANG", raising=False)
     monkeypatch.delenv("XTUNER_USE_VLLM", raising=False)
