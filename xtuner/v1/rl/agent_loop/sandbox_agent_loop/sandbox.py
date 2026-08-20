@@ -1009,6 +1009,14 @@ class SandboxPool:
             create_kwargs["env_vars"] = spec.env_vars
         if spec.resources:
             create_kwargs["resources"] = spec.resources
+        if spec.ports:
+            create_kwargs["ports"] = spec.ports
+        if spec.network_policy:
+            create_kwargs["network_policy"] = spec.network_policy
+        if spec.extensions:
+            create_kwargs["extensions"] = spec.extensions
+        if spec.entrypoint:
+            create_kwargs["entrypoint"] = spec.entrypoint
         if self._create_limiter is not None:
             t_limit = time.monotonic()
             await self._create_limiter.acquire()

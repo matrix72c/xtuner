@@ -231,6 +231,11 @@ class SandboxSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    ports: list[dict[str, Any]] = Field(default_factory=list)
+    network_policy: dict[str, Any] | None = None
+    extensions: dict[str, Any] = Field(default_factory=dict)
+    entrypoint: list[str] | None = None
+
     image: str
     ttl_seconds: int = 11700
     workspace_path: str = "/workspace"  # becomes $TASK_WORKSPACE
