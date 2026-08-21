@@ -207,6 +207,7 @@ class EntryCapture:
         entry.rc_file = f"{base}.rc"
         entry.stdout_file = f"{base}.stdout"
         entry.stderr_file = f"{base}.stderr"
+        entry.sandbox_identity_file = f"{base}.identity"
 
 
 class ShellEntry:
@@ -309,6 +310,17 @@ class ShellEntry:
             )
 
 
+# Fingerprint used to detect whether the sandbox container was restarted while a
+# detached entry was running: the kernel boot id (bumps on host boot / sysbox
+# container restart) plus the start time of PID 1 (bumps whenever the container
+# main process is replaced).  Both are read inside the sandbox and compared
+# between entry launch and failure.
+_CONTAINER_IDENTITY_CMD = (
+    "cat /proc/sys/kernel/random/boot_id 2>/dev/null; "
+    "awk '{print $22}' /proc/1/stat 2>/dev/null"
+)
+
+
 class DetachedShellEntry:
     """One detached shell entry observed through client pid polling.
 
@@ -402,12 +414,14 @@ class DetachedShellEntry:
         entry: EntryRecord,
         env: dict[str, str],
     ) -> EntryOutcome:
-        assert entry.rc_file and entry.stdout_file and entry.stderr_file
+        assert entry.rc_file and entry.stdout_file and entry.stderr_file and entry.sandbox_identity_file
         rc_file = shlex.quote(entry.rc_file)
         stdout_file = shlex.quote(entry.stdout_file)
         stderr_file = shlex.quote(entry.stderr_file)
+        identity_file = shlex.quote(entry.sandbox_identity_file)
         wrapped = (
-            f"rm -f {rc_file} {stdout_file} {stderr_file}; "
+            f"rm -f {rc_file} {stdout_file} {stderr_file} {identity_file}; "
+            f"({_CONTAINER_IDENTITY_CMD}) > {identity_file} 2>&1; "
             f"({self.cmd}) > {stdout_file} 2> {stderr_file}; "
             f"rc=$?; "
             f"printf '%s\\n' \"$rc\" > {rc_file}; "
@@ -479,6 +493,31 @@ class DetachedShellEntry:
                 )
                 if rc is None:
                     sandbox_alive = await _sandbox_alive(client)
+                    _, rc_read_error = await self._read_capture_file_ex(client, entry.rc_file)
+                    launch_identity = (
+                        await self._read_capture_file(client, entry.sandbox_identity_file) or ""
+                    ).strip()
+                    current_identity = ""
+                    try:
+                        result = await exec_in(
+                            client,
+                            f"({_CONTAINER_IDENTITY_CMD})",
+                            timeout_sec=10,
+                            raise_on_error=False,
+                        )
+                        current_identity = (result.get("stdout") or "").strip()
+                    except Exception:
+                        current_identity = ""
+                    identity_changed = bool(
+                        launch_identity and current_identity and launch_identity != current_identity
+                    )
+                    get_logger().error(
+                        f"[{item.id}] entry {entry.name} rc_missing pid={pid} polls={polls} "
+                        f"rc_file={entry.rc_file} rc_read_error={rc_read_error} "
+                        f"launch_identity={launch_identity!r} current_identity={current_identity!r} "
+                        f"identity_changed={identity_changed} "
+                        f"rc_wait_timeout_sec={self.rc_wait_timeout_sec} sandbox_alive={sandbox_alive}"
+                    )
                     return EntryOutcome(
                         source="detach_exec",
                         reason="rc_missing",
@@ -486,6 +525,11 @@ class DetachedShellEntry:
                         details={
                             "pid": pid,
                             "polls": polls,
+                            "rc_file": entry.rc_file,
+                            "rc_read_error": rc_read_error,
+                            "launch_identity": launch_identity,
+                            "current_identity": current_identity,
+                            "identity_changed": identity_changed,
                             "rc_wait_timeout_sec": self.rc_wait_timeout_sec,
                             "rc_poll_interval_sec": self.rc_poll_interval_sec,
                             "sandbox_alive": sandbox_alive,
@@ -610,11 +654,21 @@ class DetachedShellEntry:
         return None
 
     async def _read_capture_file(self, client: Any, path: str, timeout_sec: float = 5.0) -> str | None:
+        content, _error = await self._read_capture_file_ex(client, path, timeout_sec=timeout_sec)
+        return content
+
+    async def _read_capture_file_ex(
+        self, client: Any, path: str, timeout_sec: float = 5.0
+    ) -> tuple[str | None, str | None]:
         try:
             blob = await asyncio.wait_for(client.download_file(path), timeout=timeout_sec)
-        except Exception:
-            return None
-        return blob.decode(errors="replace")
+        except asyncio.TimeoutError:
+            return None, "timeout"
+        except httpx.HTTPStatusError as exc:
+            return None, f"http_{exc.response.status_code}"
+        except Exception as exc:
+            return None, type(exc).__name__
+        return blob.decode(errors="replace"), None
 
     def _finish_record(self, entry: EntryRecord, outcome: EntryOutcome, *, exc: Exception | None = None) -> None:
         entry.finished_at = time.monotonic()
