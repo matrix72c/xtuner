@@ -118,6 +118,7 @@ class EntryRecord(BaseModel):
     rc_file: str | None = None
     stdout_file: str | None = None
     stderr_file: str | None = None
+    sandbox_identity_file: str | None = None
 
     started_at: float | None = None
     finished_at: float | None = None
