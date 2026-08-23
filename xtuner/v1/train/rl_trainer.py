@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from shutil import rmtree
-from typing import Any, List, cast
+from typing import Any, Iterator, List, cast
 
 import numpy as np
 import ray
@@ -292,6 +292,26 @@ def is_valid_for_training(group_data_items: list[RolloutState], logger) -> bool:
     return True
 
 
+def _iter_payload_scalars(payload: dict) -> Iterator[tuple[str, float]]:
+    """Yield ``("flat/key", value)`` numeric leaves of a reward payload.
+
+    Used to surface judger-emitted metrics (e.g. outcome flags or process-reward
+    breakdowns carried in ``RolloutState.reward``) as per-step scalars. Only
+    plain numbers and one level of dict nesting are flattened; deeper
+    structures (per-criterion dicts, string lists) are left in the payload for
+    offline trajectory analysis.
+    """
+    for key, value in payload.items():
+        if key == "score" or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            yield key, float(value)
+        elif isinstance(value, dict):
+            for name, item in value.items():
+                if isinstance(item, (int, float)) and not isinstance(item, bool):
+                    yield f"{key}/{name}", float(item)
+
+
 def _validate_sync_intervals(
     sync_weights_interval: int,
     checkpoint_interval: int | None,
@@ -367,7 +387,7 @@ class BaseRLTrainerConfig(BaseModel):
     debug_rollout_dir: Path | str | None = None
     debug_train: bool = False
     skip_checkpoint_validation: bool = False
-    exp_tracker: Literal["tensorboard", "jsonl"] = "tensorboard"
+    exp_tracker: Literal["tensorboard", "jsonl", "wandb"] = "tensorboard"
     trace_config: TraceConfig = Field(default_factory=TraceConfig)
 
     @model_validator(mode="after")
@@ -454,7 +474,7 @@ class RLColocateTrainerConfig(BaseRLTrainerConfig):
             False.
         skip_checkpoint_validation (bool): Whether to skip checkpoint
             validation. Defaults to False.
-        exp_tracker (Literal["tensorboard", "jsonl"]): Experiment tracker type.
+        exp_tracker (Literal["tensorboard", "jsonl", "wandb"]): Experiment tracker type.
             Defaults to "tensorboard".
         resources (AcceleratorResourcesConfig): Shared accelerator resources
             used by both training and rollout workers.
@@ -542,7 +562,7 @@ class RLDisaggregatedTrainerConfig(BaseRLTrainerConfig):
             False.
         skip_checkpoint_validation (bool): Whether to skip checkpoint
             validation. Defaults to False.
-        exp_tracker (Literal["tensorboard", "jsonl"]): Experiment tracker type.
+        exp_tracker (Literal["tensorboard", "jsonl", "wandb"]): Experiment tracker type.
             Defaults to "tensorboard".
         train_resources (AcceleratorResourcesConfig): Accelerator resources for
             training workers.
@@ -1056,6 +1076,12 @@ class BaseRLTrainer:
         prompt_len_list = []
         response_len_list = []
         tool_turns_list: list[int] = []
+        # Judger-emitted reward-payload metrics, collected once per session (same
+        # dedup as cluster_rewards) and aggregated into judge/* scalars below.
+        judge_scalars: dict[str, list[float]] = {}
+        # Sandbox lifecycle metadata from the infer stage (create/ready/install
+        # timings), aggregated into sandbox/* scalars below.
+        sandbox_scalars: dict[str, list[float]] = {}
         training_tokens = 0
 
         data_batches = []
@@ -1098,6 +1124,13 @@ class BaseRLTrainer:
                     cluster_index_by_key[cluster_key] = cluster_index
                     cluster_rewards.append(reward)
                     cluster_representatives.append(data)
+                    if isinstance(data.reward, dict):
+                        for name, value in _iter_payload_scalars(data.reward):
+                            judge_scalars.setdefault(name, []).append(value)
+                    infer_metadata = data.extra_fields.get("agent_infer_metadata")
+                    if isinstance(infer_metadata, dict):
+                        for name, value in _iter_payload_scalars(infer_metadata):
+                            sandbox_scalars.setdefault(name, []).append(value)
                 sample_cluster_indices.append(cluster_index)
                 # 有可能有重复，但是没有其他更好办法
                 turns = data.extra_fields.get("agent_tool_turns")
@@ -1282,6 +1315,10 @@ class BaseRLTrainer:
             info_dict["tool_turns/mean"] = tool_turns_t.mean().item()
             info_dict["tool_turns/min"] = float(tool_turns_t.min().item())
             info_dict["tool_turns/max"] = float(tool_turns_t.max().item())
+        for name, values in judge_scalars.items():
+            info_dict[f"judge/{name}"] = sum(values) / len(values)
+        for name, values in sandbox_scalars.items():
+            info_dict[f"sandbox/{name}"] = sum(values) / len(values)
         return data_batches, info_dict
 
     def _compute_benchmark_metrics(

@@ -428,7 +428,7 @@ class TrainerConfig(BaseModel):
     check_health_interval: int | None = None
     hf_interval: int | None = None
     hf_max_keep: int | None = None
-    exp_tracker: Literal["tensorboard", "jsonl"] = "jsonl"
+    exp_tracker: Literal["tensorboard", "jsonl", "wandb"] = "jsonl"
     profile_step: list[int] | int | None = None
     profile_time: bool = True
     profile_memory: bool = False
@@ -553,7 +553,7 @@ class Trainer:
         check_health_interval: int | None = None,
         hf_interval: int | None = None,
         hf_max_keep: int | None = None,
-        exp_tracker: Literal["tensorboard", "jsonl"] = "jsonl",
+        exp_tracker: Literal["tensorboard", "jsonl", "wandb"] = "jsonl",
         profile_step: list[int] | int | None = None,
         profile_time: bool = True,
         profile_memory: bool = False,
@@ -1098,7 +1098,7 @@ class Trainer:
         logger.add(sys.stderr, format=log_format(rank=get_rank()), level=log_level)
         return logger, log_dir
 
-    def _init_tracker(self, exp_tracker: Literal["tensorboard", "jsonl"], log_dir: Path):
+    def _init_tracker(self, exp_tracker: Literal["tensorboard", "jsonl", "wandb"], log_dir: Path):
         writer = get_writer(writer_type=exp_tracker, log_dir=log_dir)
         return writer
 
