@@ -288,6 +288,7 @@ class AgentInSandboxLoop(AgentLoop):
         )
         rollout_state.reward = _extract_reward_payload(item)
         rollout_state.extra_fields["agent_status"] = item.status.value
+        rollout_state.extra_fields["agent_infer_metadata"] = dict(item.infer.metadata)
         selected_agent = _selected_agent(item)
         if selected_agent is not None:
             rollout_state.extra_fields["agent_name"] = selected_agent.get("name")
