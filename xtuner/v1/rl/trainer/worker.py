@@ -195,6 +195,9 @@ class WorkerInputItem(TypedDict):
     shifted_labels: torch.LongTensor
     advantages: torch.Tensor
     rollout_logprobs: torch.Tensor | None
+    # Per-token rewards for PPO, packed and zero-padded alongside the labels.
+    # Absent for group-baseline algorithms, which need no value function.
+    token_rewards: NotRequired[torch.Tensor]
 
 
 class WorkerTrainLogItem(TypedDict, total=False):
