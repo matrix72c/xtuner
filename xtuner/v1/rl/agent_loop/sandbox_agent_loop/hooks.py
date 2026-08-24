@@ -487,11 +487,16 @@ class RunAgentInstallDeps(Hook):
 
 
 class ParseJudgerStdout(Hook):
-    """Parse the judger stage stdout into ``record.score`` (and optional
-    criteria into ``record.metadata['criteria']``).
+    """Parse the judger stage stdout into ``record.score`` and metadata.
+
+    Stores the parsed payload under ``record.metadata['reward']`` — the key
+    :meth:`AgentRolloutItem` -> ``RolloutState`` conversion reads to build the
+    reward dict — so judger-emitted metrics (``criteria`` plus any extra
+    ``metadata`` fields the judger printed, e.g. outcome / process-reward
+    breakdowns) survive into the reward payload instead of being dropped.
 
     Accepts the two payload shapes the wrappers can emit:
-      - dict with a ``total`` key (and optional ``criteria``).
+      - dict with a ``total`` key (and optional ``criteria`` / ``metadata``).
       - ``{"total_score": ..., <criterion>: <number>, …}`` (legacy shape).
 
     On parse failure: leaves ``record.score`` as ``None`` and marks the stage
@@ -508,7 +513,7 @@ class ParseJudgerStdout(Hook):
         if record.entry_result is None:
             raise RuntimeError("ParseJudgerStdout requires record.entry_result")
         try:
-            score, criteria = _parse_stage_stdout(record.entry_result)
+            score, criteria, metadata = _parse_stage_stdout(record.entry_result)
         except _ParseError as exc:
             record.score = None
             record.status = StageStatus.FAILED
@@ -522,6 +527,9 @@ class ParseJudgerStdout(Hook):
         record.score = score
         if criteria:
             record.metadata["criteria"] = criteria
+        reward_payload: dict[str, Any] = dict(metadata)
+        reward_payload["criteria"] = criteria
+        record.metadata["reward"] = reward_payload
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -533,8 +541,8 @@ class _ParseError(RuntimeError):
     pass
 
 
-def _parse_stage_stdout(result: StageResult) -> tuple[float, dict[str, dict[str, float]]]:
-    """Returns ``(score, criteria)`` or raises :class:`_ParseError`."""
+def _parse_stage_stdout(result: StageResult) -> tuple[float, dict[str, dict[str, float]], dict[str, Any]]:
+    """Returns ``(score, criteria, metadata)`` or raises :class:`_ParseError`."""
     if result.return_code != 0:
         raise _ParseError(f"return_code={result.return_code}: {result.stderr}")
     stdout = result.stdout.strip()
@@ -558,11 +566,14 @@ def _parse_stage_stdout(result: StageResult) -> tuple[float, dict[str, dict[str,
         if not isinstance(total, (int, float)) or not 0 <= total <= 1:
             raise _ParseError(f"total out of range: {total!r}")
         criteria = payload.get("criteria") or {}
-        return float(total), criteria
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise _ParseError(f"metadata must be an object: {metadata!r}")
+        return float(total), criteria, metadata
 
     if isinstance(payload, dict) and "total_score" in payload:
         total = float(payload.pop("total_score"))
         criteria = {k: {"score": float(v)} for k, v in payload.items() if isinstance(v, (int, float))}
-        return total, criteria
+        return total, criteria, {}
 
     raise _ParseError(f"unrecognized payload: {json_line[:200]}")

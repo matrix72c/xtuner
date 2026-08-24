@@ -1,8 +1,12 @@
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .jsonl_writer import JsonlWriter
 from .tb_writer import TensorboardWriter
+
+
+if TYPE_CHECKING:
+    from .wandb_writer import WandbWriter
 
 
 class Writer(Protocol):
@@ -38,6 +42,10 @@ def get_writer(
         return JsonlWriter(log_dir=log_dir)
     elif writer_type == "tensorboard":
         return TensorboardWriter(log_dir=log_dir)
+    elif writer_type == "wandb":
+        from .wandb_writer import WandbWriter
+
+        return WandbWriter(log_dir=log_dir)
     else:
         raise ValueError(f"Unknown writer type: {writer_type}")
 
