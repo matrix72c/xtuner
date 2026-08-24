@@ -9,6 +9,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
+
 try:
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 except ImportError:
@@ -151,6 +152,49 @@ def nested_span_order() -> None:
     )
 
 
+def synthetic_spans() -> None:
+    exporter = _install_in_memory_exporter()
+
+    with (
+        mock.patch.object(trace_api, "_ensure_trace_runtime_from_env"),
+        mock.patch.object(trace_api, "is_trace_enabled", return_value=True),
+    ):
+        root_ids = trace_api.record_synthetic_span(
+            "reconstructed_agent_run",
+            start_time_unix_ns=1_000_000_000,
+            end_time_unix_ns=3_000_000_000,
+            attributes={"xtuner.stage": "agent.run"},
+        )
+        assert root_ids is not None
+        child_ids = trace_api.record_synthetic_span(
+            "reconstructed_tool_call.1",
+            start_time_unix_ns=1_500_000_000,
+            end_time_unix_ns=2_000_000_000,
+            parent_carrier={
+                "traceparent": f"00-{root_ids['trace_id']}-{root_ids['span_id']}-01",
+            },
+            status="error",
+            error_message="tool failed",
+        )
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    root = spans["reconstructed_agent_run"]
+    child = spans["reconstructed_tool_call.1"]
+    _emit(
+        {
+            "root_ids": root_ids,
+            "child_ids": child_ids,
+            "child_parent_span_id": f"{child.parent.span_id:016x}" if child.parent else None,
+            "root_start_time": root.start_time,
+            "root_end_time": root.end_time,
+            "child_status": child.status.status_code.name,
+            "child_attributes": {
+                key: _json_safe(value) for key, value in child.attributes.items()
+            },
+        }
+    )
+
+
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "record-span":
@@ -161,6 +205,8 @@ def main() -> None:
         parent_child()
     elif command == "nested-span-order":
         nested_span_order()
+    elif command == "synthetic-spans":
+        synthetic_spans()
     else:
         raise SystemExit(f"unknown trace utils command: {command}")
 
