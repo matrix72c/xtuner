@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import subprocess
@@ -85,8 +86,7 @@ class TestTrace(unittest.TestCase):
         class RemoteMethod:
             def remote(self, rollout_states):
                 observed_carriers.extend(
-                    dict(state.extra_fields[rollout_api.TRACE_CARRIER_EXTRA_FIELD])
-                    for state in rollout_states
+                    dict(state.extra_fields[rollout_api.TRACE_CARRIER_EXTRA_FIELD]) for state in rollout_states
                 )
                 return "object-ref"
 
@@ -109,9 +109,7 @@ class TestTrace(unittest.TestCase):
             observed_carriers,
             [{"traceparent": "00-trace-span-01"}, {"traceparent": "00-trace-span-01"}],
         )
-        self.assertTrue(
-            all(rollout_api.TRACE_CARRIER_EXTRA_FIELD not in state.extra_fields for state in states)
-        )
+        self.assertTrue(all(rollout_api.TRACE_CARRIER_EXTRA_FIELD not in state.extra_fields for state in states))
 
     def test_viewer_uses_span_name_path_for_display_chain(self):
         from recipe.trace.viewer.payload import build_rollout_view_payload_from_jaeger_traces
@@ -251,9 +249,7 @@ class TestSessionServerTrace(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, response)
         self.assertEqual(observed["name"], "session_server.request")
         self.assertEqual(observed["parent_carrier"], request.headers)
-        set_attributes.assert_called_once_with(
-            {"http.response.status_code": 201, "error": False}
-        )
+        set_attributes.assert_called_once_with({"http.response.status_code": 201, "error": False})
 
     async def test_send_request_injects_current_context(self):
         from xtuner.v1.rl.rollout import session_server
@@ -296,7 +292,12 @@ class TestSessionServerTrace(unittest.IsolatedAsyncioTestCase):
 
 class TestSandboxTraceBridge(unittest.TestCase):
     def test_legacy_span_is_preserved_and_sensitive_annotations_stay_out_of_otel(self):
-        from xtuner.v1.rl.agent_loop.sandbox_agent_loop import trace as sandbox_trace
+        trace_path = Path(__file__).resolve().parents[2] / "xtuner/v1/rl/agent_loop/sandbox_agent_loop/trace.py"
+        spec = importlib.util.spec_from_file_location("sandbox_trace_test", trace_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        sandbox_trace = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sandbox_trace)
 
         observed_spans = []
         observed_final_attributes = []
@@ -306,9 +307,7 @@ class TestSandboxTraceBridge(unittest.TestCase):
             observed_spans.append((name, dict(attributes or {})))
             yield
 
-        with TemporaryDirectory() as temp_dir, mock.patch.dict(
-            os.environ, {"WORK_DIR": temp_dir}
-        ):
+        with TemporaryDirectory() as temp_dir, mock.patch.dict(os.environ, {"WORK_DIR": temp_dir}):
             sandbox_trace._reset_for_testing()
             sandbox_trace.init_writer(actor_id="test")
             with (
