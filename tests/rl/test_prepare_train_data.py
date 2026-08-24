@@ -215,6 +215,72 @@ class TestPrepareTrainData(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._prepare(trainer, [[state]], pack_max_length=4)
 
+    def test_judge_metrics_aggregated_from_reward_payload(self):
+        # judger 写进 reward payload 的数值指标要按 session 聚合成 judge/* scalar。
+        trainer = self._build_trainer([1.5, 0.5])
+        first = self._state(
+            uid=1,
+            response_ids=[20, 21],
+            reward={"score": 1.0, "outcome": 1, "test_rc": 0, "parts": {"S1_recon": 0.06, "S2_attempt": 0.1}},
+            extra_fields={"agent_infer_metadata": {"install_agent_time_s": 10.0}},
+        )
+        second = self._state(
+            uid=2,
+            response_ids=[30, 31],
+            reward={"score": 0.2, "outcome": 0, "test_rc": 1, "parts": {"S1_recon": 0.03, "S2_attempt": 0.02}},
+            extra_fields={"agent_infer_metadata": {"install_agent_time_s": 30.0}},
+        )
+
+        _, info = self._prepare(trainer, [[first, second]])
+
+        self.assertAlmostEqual(info["judge/outcome"], 0.5)
+        self.assertAlmostEqual(info["judge/test_rc"], 0.5)
+        self.assertAlmostEqual(info["judge/parts/S1_recon"], 0.045)
+        self.assertAlmostEqual(info["judge/parts/S2_attempt"], 0.06)
+        self.assertAlmostEqual(info["sandbox/install_agent_time_s"], 20.0)
+
+    def test_judge_metrics_deduped_per_session(self):
+        # 一个 session 拆成多个 trainable segment 时 reward 共享，judge/* 不能重复计数。
+        trainer = self._build_trainer([1.0, 1.0])
+        first = self._state(
+            uid=1,
+            response_ids=[20, 21],
+            reward={"score": 1.0, "outcome": 1},
+        )
+        second = self._state(
+            uid=2,
+            response_ids=[30, 31],
+            reward={"score": 1.0, "outcome": 1},
+        )
+        for state in (first, second):
+            state.session_id = 42  # same session -> same cluster
+
+        _, info = self._prepare(trainer, [[first, second]])
+
+        self.assertAlmostEqual(info["judge/outcome"], 1.0)
+        self.assertEqual(info["batch_size"], 2)  # segments still counted per-sample
+
+    def test_judge_payload_non_scalars_are_ignored(self):
+        # criteria（dict-of-dict）与字符串列表不应进入 scalar 聚合，只留在 payload 供离线分析。
+        trainer = self._build_trainer([1.0])
+        state = self._state(
+            uid=1,
+            response_ids=[20, 21],
+            reward={
+                "score": 0.3,
+                "criteria": {"process": {"score": 0.3, "weight": 1.0}},
+                "source": "process",
+                "dbg": {"turns": 4},
+            },
+        )
+
+        _, info = self._prepare(trainer, [[state]])
+
+        self.assertAlmostEqual(info["judge/dbg/turns"], 4.0)
+        self.assertNotIn("judge/criteria/process/score", info)
+        self.assertNotIn("judge/source", info)
+        self.assertNotIn("judge/score", info)
+
 
 if __name__ == "__main__":
     unittest.main()
