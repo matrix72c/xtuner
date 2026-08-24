@@ -116,6 +116,42 @@ def current_span_ids() -> dict[str, str] | None:
     }
 
 
+def record_synthetic_span(
+    name: str,
+    *,
+    start_time_unix_ns: int,
+    end_time_unix_ns: int,
+    attributes: Mapping[str, Any],
+    status: str,
+    error_message: str | None,
+) -> dict[str, str] | None:
+    """Record one already-finished interval against the current context."""
+
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+
+    span = trace.get_tracer("xtuner").start_span(
+        name,
+        attributes=attributes,
+        start_time=start_time_unix_ns,
+    )
+    try:
+        if status == "error":
+            description = error_message or "error"
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", description)
+            span.set_status(Status(StatusCode.ERROR, description))
+        span_context = span.get_span_context()
+        if not span_context.is_valid:
+            return None
+        return {
+            "trace_id": f"{span_context.trace_id:032x}",
+            "span_id": f"{span_context.span_id:016x}",
+        }
+    finally:
+        span.end(end_time=end_time_unix_ns)
+
+
 def add_event(name: str, *, attributes: Mapping[str, Any] | None = None) -> None:
     from opentelemetry import trace
 
