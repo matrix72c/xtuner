@@ -2,7 +2,9 @@ import json
 import os
 import subprocess
 import sys
+import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -141,6 +143,66 @@ class TestTrace(unittest.TestCase):
         self.assertEqual(output["span_name_paths"]["order.parent"], ["order.parent"])
         self.assertEqual(output["span_name_paths"]["order.child"], ["order.parent", "order.child"])
 
+    def test_synthetic_spans_preserve_historical_times_and_parentage(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        output = _run_trace_utils(repo_root, "synthetic-spans")
+
+        self.assertEqual(output["root_ids"]["span_id"], output["child_parent_span_id"])
+        self.assertEqual(output["root_ids"]["trace_id"], output["child_ids"]["trace_id"])
+        self.assertEqual(output["root_start_time"], 1_000_000_000)
+        self.assertEqual(output["root_end_time"], 3_000_000_000)
+        self.assertEqual(output["child_status"], "ERROR")
+        self.assertTrue(output["child_attributes"]["xtuner.synthetic"])
+        self.assertEqual(output["child_attributes"]["error.message"], "tool failed")
+
+    def test_synthetic_span_validates_interval_before_runtime_setup(self):
+        from xtuner.v1.rl.trace import api as trace_api
+
+        with self.assertRaisesRegex(ValueError, "greater than"):
+            trace_api.record_synthetic_span(
+                "invalid.interval",
+                start_time_unix_ns=2,
+                end_time_unix_ns=1,
+            )
+
+    def test_rollout_remote_propagates_and_cleans_batch_carriers(self):
+        from xtuner.v1.data_proto.rl_data import RolloutState
+        from xtuner.v1.rl.trace import rollout_api
+
+        states = [RolloutState(message=[], rollout_id=index) for index in (1, 2)]
+        observed_carriers = []
+
+        class RemoteMethod:
+            def remote(self, rollout_states):
+                observed_carriers.extend(
+                    dict(state.extra_fields[rollout_api.TRACE_CARRIER_EXTRA_FIELD])
+                    for state in rollout_states
+                )
+                return "object-ref"
+
+        with (
+            mock.patch.object(rollout_api, "is_rollout_trace_enabled", return_value=True),
+            mock.patch.object(
+                rollout_api.trace_api,
+                "inject_trace_context",
+                return_value={"traceparent": "00-trace-span-01"},
+            ),
+        ):
+            result = rollout_api.trace_rollout_remote(
+                RemoteMethod(),
+                states,
+                target=states,
+            )
+
+        self.assertEqual(result, "object-ref")
+        self.assertEqual(
+            observed_carriers,
+            [{"traceparent": "00-trace-span-01"}, {"traceparent": "00-trace-span-01"}],
+        )
+        self.assertTrue(
+            all(rollout_api.TRACE_CARRIER_EXTRA_FIELD not in state.extra_fields for state in states)
+        )
+
     def test_viewer_uses_span_name_path_for_display_chain(self):
         from recipe.trace.viewer.payload import build_rollout_view_payload_from_jaeger_traces
 
@@ -241,6 +303,130 @@ class TestTrace(unittest.TestCase):
         self.assertEqual(payload["samples"][0]["stage"], "stage_two")
         self.assertIn("XTuner Rollout Trace Viewer", html)
         self.assertIn("stage_two", html)
+
+
+class TestSessionServerTrace(unittest.IsolatedAsyncioTestCase):
+    async def test_request_span_extracts_parent_and_records_status(self):
+        from xtuner.v1.rl.rollout import session_server
+
+        server = object.__new__(session_server.SessionServer)
+        request = types.SimpleNamespace(
+            match_info={"path": "v1/chat/completions"},
+            headers={"traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"},
+            method="POST",
+        )
+        response = types.SimpleNamespace(status=201)
+        observed = {}
+
+        @contextmanager
+        def capture_span(name, attributes=None, *, parent_carrier=None):
+            observed.update(
+                name=name,
+                attributes=dict(attributes or {}),
+                parent_carrier=dict(parent_carrier or {}),
+            )
+            yield
+
+        with (
+            mock.patch.object(session_server, "trace_span", side_effect=capture_span),
+            mock.patch.object(session_server, "set_trace_attributes") as set_attributes,
+            mock.patch.object(
+                session_server.SessionServer,
+                "_handle_request_impl",
+                new=mock.AsyncMock(return_value=response),
+            ),
+        ):
+            result = await server._handle_request(request)
+
+        self.assertIs(result, response)
+        self.assertEqual(observed["name"], "session_server.request")
+        self.assertEqual(observed["parent_carrier"], request.headers)
+        set_attributes.assert_called_once_with(
+            {"http.response.status_code": 201, "error": False}
+        )
+
+    async def test_send_request_injects_current_context(self):
+        from xtuner.v1.rl.rollout import session_server
+
+        server = object.__new__(session_server.SessionServer)
+        response = types.SimpleNamespace(status=200)
+        forwarded = {}
+
+        class RequestContext:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Client:
+            def request(self, **kwargs):
+                forwarded.update(kwargs)
+                return RequestContext()
+
+        @contextmanager
+        def passthrough_span(*args, **kwargs):
+            yield
+
+        def inject(headers):
+            headers["traceparent"] = "injected"
+            return headers
+
+        headers = {}
+        with (
+            mock.patch.object(session_server, "trace_span", side_effect=passthrough_span),
+            mock.patch.object(session_server, "inject_trace_context", side_effect=inject),
+        ):
+            async with server._send_request(Client(), method="POST", url="http://worker", headers=headers):
+                pass
+
+        self.assertEqual(headers["traceparent"], "injected")
+        self.assertIs(forwarded["headers"], headers)
+
+
+class TestSandboxTraceBridge(unittest.TestCase):
+    def test_legacy_span_is_preserved_and_sensitive_annotations_stay_out_of_otel(self):
+        from xtuner.v1.rl.agent_loop.sandbox_agent_loop import trace as sandbox_trace
+
+        observed_spans = []
+        observed_final_attributes = []
+
+        @contextmanager
+        def capture_span(name, attributes=None):
+            observed_spans.append((name, dict(attributes or {})))
+            yield
+
+        with TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ, {"WORK_DIR": temp_dir}
+        ):
+            sandbox_trace._reset_for_testing()
+            sandbox_trace.init_writer(actor_id="test")
+            with (
+                mock.patch.object(sandbox_trace, "trace_span", side_effect=capture_span),
+                mock.patch.object(
+                    sandbox_trace,
+                    "set_trace_attributes",
+                    side_effect=lambda attrs: observed_final_attributes.append(dict(attrs)),
+                ),
+            ):
+                with sandbox_trace.span("session-1", "acquire", task_id="task-1") as handle:
+                    handle.annotate(
+                        sandbox_name="default",
+                        sandbox_image="sandbox:latest",
+                        sandbox_url="http://secret.internal/sandbox",
+                    )
+            sandbox_trace._reset_for_testing()
+
+            legacy_files = list((Path(temp_dir) / "trace").glob("spans.*.jsonl"))
+            self.assertEqual(len(legacy_files), 1)
+            legacy_records = [json.loads(line) for line in legacy_files[0].read_text().splitlines()]
+
+        self.assertEqual(observed_spans[0][0], "sandbox.acquire")
+        self.assertEqual(observed_spans[0][1]["xtuner.session_id"], "session-1")
+        self.assertEqual(observed_final_attributes[0]["sandbox.sandbox_name"], "default")
+        self.assertNotIn("sandbox.sandbox_url", observed_final_attributes[0])
+        self.assertEqual([record["event"] for record in legacy_records], ["enter", "exit"])
+        self.assertEqual(legacy_records[-1]["sandbox_url"], "http://secret.internal/sandbox")
 
 
 if __name__ == "__main__":
