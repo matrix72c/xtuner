@@ -35,10 +35,27 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 
+from xtuner.v1.rl.trace import set_trace_attributes, trace_span
 from xtuner.v1.utils import get_logger
 
 
 _writer: _TraceWriter | None = None
+
+_OTEL_STAGE_NAMES = {
+    "run_total": "sandbox_agent.run",
+    "acquire": "sandbox.acquire",
+    "infer": "sandbox.infer",
+    "validate": "sandbox.validate",
+    "release": "sandbox.release",
+}
+_OTEL_ANNOTATION_KEYS = {
+    "agent_name",
+    "reward",
+    "sandbox_create_attempts",
+    "sandbox_image",
+    "sandbox_name",
+    "status",
+}
 
 
 def init_writer(actor_id: str | None = None) -> None:
@@ -169,29 +186,54 @@ def span(uid: str, stage: str, **extra: Any) -> Iterator[SpanHandle]:
         if extra:
             enter.update(extra)
         _writer.write_span(enter)
-    try:
-        yield handle
-    except BaseException as exc:
-        handle.ok = False
-        handle.err = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        duration_ms = int((time.monotonic() - t_start) * 1000)
-        if _writer is not None:
-            record: dict[str, Any] = {
-                "ts": time.time(),
-                "event": "exit",
-                "uid": uid,
-                "stage": stage,
-                "duration_ms": duration_ms,
-                "ok": handle.ok,
-                "err": handle.err,
+    otel_name = _OTEL_STAGE_NAMES.get(stage, f"sandbox.{stage}")
+    otel_attributes = {
+        "xtuner.stage": otel_name,
+        "xtuner.rollout_id": uid,
+        "xtuner.session_id": uid,
+    }
+    if extra.get("task_id") is not None:
+        otel_attributes["sandbox.task_id"] = extra["task_id"]
+    if extra.get("group_id") is not None:
+        otel_attributes["xtuner.group_id"] = extra["group_id"]
+    with trace_span(otel_name, attributes=otel_attributes):
+        try:
+            yield handle
+        except BaseException as exc:
+            handle.ok = False
+            handle.err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            duration_ms = int((time.monotonic() - t_start) * 1000)
+            final_attributes = {
+                "sandbox.ok": handle.ok,
+                "sandbox.duration_ms": duration_ms,
             }
-            if extra:
-                record.update(extra)
-            if handle.annotations:
-                record.update(handle.annotations)
-            _writer.write_span(record)
+            if not handle.ok:
+                final_attributes["error"] = True
+            final_attributes.update(
+                {
+                    f"sandbox.{key}": value
+                    for key, value in handle.annotations.items()
+                    if key in _OTEL_ANNOTATION_KEYS and value is not None
+                }
+            )
+            set_trace_attributes(final_attributes)
+            if _writer is not None:
+                record: dict[str, Any] = {
+                    "ts": time.time(),
+                    "event": "exit",
+                    "uid": uid,
+                    "stage": stage,
+                    "duration_ms": duration_ms,
+                    "ok": handle.ok,
+                    "err": handle.err,
+                }
+                if extra:
+                    record.update(extra)
+                if handle.annotations:
+                    record.update(handle.annotations)
+                _writer.write_span(record)
 
 
 def _reset_for_testing() -> None:
