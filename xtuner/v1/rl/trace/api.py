@@ -152,6 +152,52 @@ def inject_trace_context(carrier: dict[str, str] | None = None) -> dict[str, str
     return target
 
 
+def record_synthetic_span(
+    name: str,
+    *,
+    start_time_unix_ns: int,
+    end_time_unix_ns: int,
+    attributes: Mapping[str, Any] | None = None,
+    parent_carrier: Mapping[str, str] | None = None,
+    status: str = "completed",
+    error_message: str | None = None,
+) -> dict[str, str] | None:
+    """Record a historical interval in the active XTuner trace runtime."""
+
+    span_name, normalized_attributes = _validate_trace_inputs(name=name, attributes=attributes)
+    assert span_name is not None
+    if isinstance(start_time_unix_ns, bool) or not isinstance(start_time_unix_ns, int):
+        raise TypeError("start_time_unix_ns must be an integer")
+    if isinstance(end_time_unix_ns, bool) or not isinstance(end_time_unix_ns, int):
+        raise TypeError("end_time_unix_ns must be an integer")
+    if start_time_unix_ns < 0:
+        raise ValueError("start_time_unix_ns must be non-negative")
+    if end_time_unix_ns <= start_time_unix_ns:
+        raise ValueError("end_time_unix_ns must be greater than start_time_unix_ns")
+    if status not in {"completed", "error"}:
+        raise ValueError("status must be 'completed' or 'error'")
+    if error_message is not None and not isinstance(error_message, str):
+        raise TypeError("error_message must be a string or None")
+
+    _ensure_trace_runtime_from_env()
+    if not is_trace_enabled():
+        return None
+
+    normalized_attributes = dict(normalized_attributes)
+    normalized_attributes.setdefault("xtuner.synthetic", True)
+    with _attach_parent_carrier(parent_carrier):
+        span_name_path = (*_CURRENT_SPAN_NAME_PATH.get(), span_name)
+        normalized_attributes.setdefault(_SPAN_NAME_PATH_ATTRIBUTE, span_name_path)
+        return otel_utils.record_synthetic_span(
+            span_name,
+            start_time_unix_ns=start_time_unix_ns,
+            end_time_unix_ns=end_time_unix_ns,
+            attributes=normalized_attributes,
+            status=status,
+            error_message=error_message,
+        )
+
+
 @contextmanager
 def _attach_parent_carrier(parent_carrier: Mapping[str, str] | None):
     if parent_carrier is None:
@@ -250,6 +296,7 @@ def _normalize_trace_attribute_value(value: Any) -> Any:
 
 __all__ = [
     "inject_trace_context",
+    "record_synthetic_span",
     "set_trace_attributes",
     "trace_event",
     "trace_function",
