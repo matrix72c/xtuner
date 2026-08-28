@@ -325,23 +325,6 @@ class AgentInSandboxLoop(AgentLoop):
             self._fill_eval_rollout_state(rollout_state, item)
             return [rollout_state]
 
-        segments: list[tuple[list[dict[str, Any]], Any]] | None = None
-        record_summary: dict[str, Any] | None = None
-        if item.status == RolloutStatus.COMPLETED:
-            raw_trace = _load_messages_artifact(item.artifacts)
-            assert raw_trace is not None
-            segments = _load_train_trace_segments(item.artifacts)
-            if not segments:
-                raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-            record_summary = {
-                "session_id": str(rollout_state.session_id),
-                **_summarize_train_trace_segments(
-                    segments,
-                    artifact_record_count=len(raw_trace),
-                ),
-            }
-            _log_agent_trace_metrics("AgentTraceRecords", record_summary)
-
         response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
         rollout_state.status = Status.COMPLETED if item.status == RolloutStatus.COMPLETED else Status.FAILED
         rollout_state.finish_reason = str(
@@ -365,9 +348,22 @@ class AgentInSandboxLoop(AgentLoop):
         if item.status != RolloutStatus.COMPLETED:
             return [rollout_state]
 
-        assert segments is not None
-        assert record_summary is not None
+        raw_trace = _load_messages_artifact(item.artifacts)
+        assert raw_trace is not None
+        segments = _load_train_trace_segments(item.artifacts)
+        if not segments:
+            raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
+
         session_id = str(rollout_state.session_id)
+        record_summary = {
+            "session_id": session_id,
+            **_summarize_train_trace_segments(
+                segments,
+                artifact_record_count=len(raw_trace),
+            ),
+        }
+        _log_agent_trace_metrics("AgentTraceRecords", record_summary)
+
         rollout_states: list[RolloutState] = []
         trace_store = get_store()
         exported_token_counts: list[int] = []
@@ -487,25 +483,25 @@ class AgentInSandboxLoop(AgentLoop):
             else:
                 segment_state.response = _response_text(response_message)
             rollout_states.append(segment_state)
-
-        max_exported_tokens = max(exported_token_counts)
-        _log_agent_trace_metrics(
-            "AgentTraceSummary",
-            {
-                **record_summary,
-                "exported_token_counts": exported_token_counts,
-                "exported_action_token_counts": exported_action_token_counts,
-                "exported_expert_ref_counts": exported_expert_ref_counts,
-                "exported_expert_payload_bytes": exported_expert_payload_bytes,
-                "exported_token_sum": sum(exported_token_counts),
-                "exported_action_token_sum": sum(exported_action_token_counts),
-                "exported_expert_ref_sum": sum(exported_expert_ref_counts),
-                "exported_expert_payload_bytes_sum": sum(exported_expert_payload_bytes),
-                "candidate_expansion_ratio": (
-                    sum(exported_token_counts) / max_exported_tokens if max_exported_tokens else None
-                ),
-            },
-        )
+            if segment_index == len(segments) - 1:
+                max_exported_tokens = max(exported_token_counts)
+                _log_agent_trace_metrics(
+                    "AgentTraceSummary",
+                    {
+                        **record_summary,
+                        "exported_token_counts": exported_token_counts,
+                        "exported_action_token_counts": exported_action_token_counts,
+                        "exported_expert_ref_counts": exported_expert_ref_counts,
+                        "exported_expert_payload_bytes": exported_expert_payload_bytes,
+                        "exported_token_sum": sum(exported_token_counts),
+                        "exported_action_token_sum": sum(exported_action_token_counts),
+                        "exported_expert_ref_sum": sum(exported_expert_ref_counts),
+                        "exported_expert_payload_bytes_sum": sum(exported_expert_payload_bytes),
+                        "candidate_expansion_ratio": (
+                            sum(exported_token_counts) / max_exported_tokens if max_exported_tokens else None
+                        ),
+                    },
+                )
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
