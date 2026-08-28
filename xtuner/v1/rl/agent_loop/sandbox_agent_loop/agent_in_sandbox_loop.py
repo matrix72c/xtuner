@@ -482,7 +482,6 @@ class AgentInSandboxLoop(AgentLoop):
                 segment_state.response = self.tokenizer.decode(segment_state.response_ids)
             else:
                 segment_state.response = _response_text(response_message)
-            rollout_states.append(segment_state)
             if segment_index == len(segments) - 1:
                 max_exported_tokens = max(exported_token_counts)
                 _log_agent_trace_metrics(
@@ -502,6 +501,7 @@ class AgentInSandboxLoop(AgentLoop):
                         ),
                     },
                 )
+            rollout_states.append(segment_state)
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
