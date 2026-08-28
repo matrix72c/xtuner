@@ -366,10 +366,6 @@ class AgentInSandboxLoop(AgentLoop):
 
         rollout_states: list[RolloutState] = []
         trace_store = get_store()
-        exported_token_counts: list[int] = []
-        exported_action_token_counts: list[int] = []
-        exported_expert_ref_counts: list[int] = []
-        exported_expert_payload_bytes: list[int] = []
         for segment_index, (messages, tools) in enumerate(segments):
             if not messages:
                 raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
@@ -444,10 +440,6 @@ class AgentInSandboxLoop(AgentLoop):
             if expert_ref_count is None:
                 expert_ref_count = len(routed_experts) if isinstance(routed_experts, list) else 0
             expert_payload_bytes = trace_metrics.get("expert_payload_bytes", 0)
-            exported_token_counts.append(len(data["input_ids"]))
-            exported_action_token_counts.append(action_token_count)
-            exported_expert_ref_counts.append(expert_ref_count)
-            exported_expert_payload_bytes.append(expert_payload_bytes)
             _log_agent_trace_metrics(
                 "AgentTraceExport",
                 {
@@ -482,25 +474,6 @@ class AgentInSandboxLoop(AgentLoop):
                 segment_state.response = self.tokenizer.decode(segment_state.response_ids)
             else:
                 segment_state.response = _response_text(response_message)
-            if segment_index == len(segments) - 1:
-                max_exported_tokens = max(exported_token_counts)
-                _log_agent_trace_metrics(
-                    "AgentTraceSummary",
-                    {
-                        **record_summary,
-                        "exported_token_counts": exported_token_counts,
-                        "exported_action_token_counts": exported_action_token_counts,
-                        "exported_expert_ref_counts": exported_expert_ref_counts,
-                        "exported_expert_payload_bytes": exported_expert_payload_bytes,
-                        "exported_token_sum": sum(exported_token_counts),
-                        "exported_action_token_sum": sum(exported_action_token_counts),
-                        "exported_expert_ref_sum": sum(exported_expert_ref_counts),
-                        "exported_expert_payload_bytes_sum": sum(exported_expert_payload_bytes),
-                        "candidate_expansion_ratio": (
-                            sum(exported_token_counts) / max_exported_tokens if max_exported_tokens else None
-                        ),
-                    },
-                )
             rollout_states.append(segment_state)
         return rollout_states
 
