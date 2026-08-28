@@ -406,6 +406,7 @@ class AgentInSandboxLoop(AgentLoop):
             else:
                 segment_state.response = _response_text(response_message)
             rollout_states.append(segment_state)
+
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
