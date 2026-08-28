@@ -4,6 +4,7 @@ import asyncio
 import copy
 import importlib
 import json
+import time
 import traceback
 import uuid
 from typing import Any, Literal
@@ -14,6 +15,7 @@ from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.utils import create_task
+from xtuner.v1.utils import get_logger
 
 from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
@@ -93,6 +95,47 @@ def _load_train_trace_segments(artifacts: dict[str, Any]) -> list[tuple[list[dic
         if messages:
             segments.append((messages, tools))
     return segments
+
+
+def _json_identity(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _summarize_train_trace_segments(
+    segments: list[tuple[list[dict[str, Any]], Any]],
+    *,
+    artifact_record_count: int,
+) -> dict[str, Any]:
+    """Describe record shape without logging message or tool contents."""
+    message_counts = [len(messages) for messages, _ in segments]
+    assistant_message_counts = [
+        sum(message.get("role") == "assistant" for message in messages) for messages, _ in segments
+    ]
+    tool_identities = {_json_identity(tools) for _, tools in segments}
+
+    if len(segments) <= 1:
+        record_shape = "single"
+    elif len(tool_identities) > 1:
+        record_shape = "tools_changed"
+    else:
+        ordered_messages = sorted((messages for messages, _ in segments), key=len)
+        is_prefix_chain = all(
+            shorter == longer[: len(shorter)] for shorter, longer in zip(ordered_messages, ordered_messages[1:])
+        )
+        record_shape = "linear_prefix_or_duplicate" if is_prefix_chain else "branch_or_rewrite"
+
+    return {
+        "artifact_record_count": artifact_record_count,
+        "train_segment_count": len(segments),
+        "record_shape": record_shape,
+        "message_counts": message_counts,
+        "assistant_message_counts": assistant_message_counts,
+        "tool_variant_count": len(tool_identities),
+    }
+
+
+def _log_agent_trace_metrics(kind: str, payload: dict[str, Any]) -> None:
+    get_logger().info(f"[{kind}] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}")
 
 
 def _load_eval_trace_segment(artifacts: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
@@ -281,6 +324,25 @@ class AgentInSandboxLoop(AgentLoop):
             self._fill_eval_rollout_state(rollout_state, item)
             return [rollout_state]
 
+        segments: list[tuple[list[dict[str, Any]], Any]] | None = None
+        record_summary: dict[str, Any] | None = None
+        if item.status == RolloutStatus.COMPLETED:
+            raw_trace = _load_messages_artifact(item.artifacts)
+            assert raw_trace is not None
+            segments = _load_train_trace_segments(item.artifacts)
+            if not segments:
+                raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
+            record_summary = {
+                "session_id": str(rollout_state.session_id),
+                **_summarize_train_trace_segments(
+                    segments,
+                    artifact_record_count=len(raw_trace),
+                ),
+            }
+            # Emit this before copying the full artifact into RolloutState. If the artifact is already very large,
+            # the shape report still survives even when the subsequent copy or export exhausts the worker.
+            _log_agent_trace_metrics("AgentTraceRecords", record_summary)
+
         response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
         rollout_state.status = Status.COMPLETED if item.status == RolloutStatus.COMPLETED else Status.FAILED
         rollout_state.finish_reason = str(
@@ -292,7 +354,23 @@ class AgentInSandboxLoop(AgentLoop):
         if selected_agent is not None:
             rollout_state.extra_fields["agent_name"] = selected_agent.get("name")
             rollout_state.extra_fields["agent_selected"] = _to_json_safe(selected_agent)
+        artifact_copy_started_at = time.perf_counter()
+        _log_agent_trace_metrics(
+            "AgentTraceArtifactCopy",
+            {
+                "session_id": str(rollout_state.session_id),
+                "status": "start",
+            },
+        )
         rollout_state.extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
+        _log_agent_trace_metrics(
+            "AgentTraceArtifactCopy",
+            {
+                "session_id": str(rollout_state.session_id),
+                "duration_ms": (time.perf_counter() - artifact_copy_started_at) * 1000,
+                "status": "ok",
+            },
+        )
         rollout_state.extra_fields["agent_judgers"] = {
             name: record.model_dump(mode="json") for name, record in item.judgers.items()
         }
@@ -304,16 +382,39 @@ class AgentInSandboxLoop(AgentLoop):
         if item.status != RolloutStatus.COMPLETED:
             return [rollout_state]
 
-        segments = _load_train_trace_segments(item.artifacts)
-        if not segments:
-            raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-
+        assert segments is not None
+        assert record_summary is not None
+        session_id = str(rollout_state.session_id)
         rollout_states: list[RolloutState] = []
         trace_store = get_store()
+        exported_token_counts: list[int] = []
+        exported_action_token_counts: list[int] = []
+        exported_expert_ref_counts: list[int] = []
+        exported_expert_payload_bytes: list[int] = []
         for segment_index, (messages, tools) in enumerate(segments):
             if not messages:
                 raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
+            state_copy_started_at = time.perf_counter()
+            _log_agent_trace_metrics(
+                "AgentTraceStateCopy",
+                {
+                    "session_id": session_id,
+                    "segment_index": segment_index,
+                    "segment_count": len(segments),
+                    "status": "start",
+                },
+            )
             segment_state = rollout_state.model_copy(deep=True)
+            _log_agent_trace_metrics(
+                "AgentTraceStateCopy",
+                {
+                    "session_id": session_id,
+                    "segment_index": segment_index,
+                    "segment_count": len(segments),
+                    "duration_ms": (time.perf_counter() - state_copy_started_at) * 1000,
+                    "status": "ok",
+                },
+            )
             segment_state.extra_fields["agent_messages"] = messages
             segment_state.extra_fields["agent_tools"] = tools
             segment_state.extra_fields["agent_tool_turns"] = _count_tool_turns(messages)
@@ -328,7 +429,61 @@ class AgentInSandboxLoop(AgentLoop):
                 add_generation_prompt=False,
             )
             prompt_text = text[:-1] if text.endswith("\n") else text
-            data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
+            _log_agent_trace_metrics(
+                "AgentTraceExport",
+                {
+                    "session_id": session_id,
+                    "segment_index": segment_index,
+                    "segment_count": len(segments),
+                    "prompt_chars": len(prompt_text),
+                    "status": "start",
+                },
+            )
+            export_started_at = time.perf_counter()
+            try:
+                data = await trace_store.export_training_trace.remote(session_id, prompt_text)
+            except Exception as exc:
+                _log_agent_trace_metrics(
+                    "AgentTraceExport",
+                    {
+                        "session_id": session_id,
+                        "segment_index": segment_index,
+                        "segment_count": len(segments),
+                        "prompt_chars": len(prompt_text),
+                        "duration_ms": (time.perf_counter() - export_started_at) * 1000,
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+            routed_experts = data["routed_experts"]
+            trace_metrics = data.get("_trace_metrics", {})
+            action_token_count = trace_metrics.get("action_token_count")
+            if action_token_count is None:
+                action_token_count = sum(label != -100 for label in data["labels"])
+            expert_ref_count = trace_metrics.get("expert_ref_count")
+            if expert_ref_count is None:
+                expert_ref_count = len(routed_experts) if isinstance(routed_experts, list) else 0
+            expert_payload_bytes = trace_metrics.get("expert_payload_bytes", 0)
+            exported_token_counts.append(len(data["input_ids"]))
+            exported_action_token_counts.append(action_token_count)
+            exported_expert_ref_counts.append(expert_ref_count)
+            exported_expert_payload_bytes.append(expert_payload_bytes)
+            _log_agent_trace_metrics(
+                "AgentTraceExport",
+                {
+                    "session_id": session_id,
+                    "segment_index": segment_index,
+                    "segment_count": len(segments),
+                    "prompt_chars": len(prompt_text),
+                    "token_count": len(data["input_ids"]),
+                    "action_token_count": action_token_count,
+                    "expert_ref_count": expert_ref_count,
+                    "expert_payload_bytes": expert_payload_bytes,
+                    "duration_ms": (time.perf_counter() - export_started_at) * 1000,
+                    "status": "ok",
+                },
+            )
             segment_state.input_ids = data["input_ids"]
             segment_state.labels = data["labels"]
             # Agentic training consumes input_ids/labels directly. response_ids is
@@ -343,13 +498,31 @@ class AgentInSandboxLoop(AgentLoop):
             # TODO(incomplete): a MoE run that produced routed experts for *no* node collapses to ``None`` here and is
             # indistinguishable from a dense trace; catching that would need the MoE-vs-dense signal the loop lacks
             # (session_server gates on ``enable_return_routed_experts``).
-            segment_state.routed_experts = data["routed_experts"]
+            segment_state.routed_experts = routed_experts
             if segment_state.response_ids:
                 segment_state.response = self.tokenizer.decode(segment_state.response_ids)
             else:
                 segment_state.response = _response_text(response_message)
             rollout_states.append(segment_state)
 
+        max_exported_tokens = max(exported_token_counts)
+        _log_agent_trace_metrics(
+            "AgentTraceSummary",
+            {
+                **record_summary,
+                "exported_token_counts": exported_token_counts,
+                "exported_action_token_counts": exported_action_token_counts,
+                "exported_expert_ref_counts": exported_expert_ref_counts,
+                "exported_expert_payload_bytes": exported_expert_payload_bytes,
+                "exported_token_sum": sum(exported_token_counts),
+                "exported_action_token_sum": sum(exported_action_token_counts),
+                "exported_expert_ref_sum": sum(exported_expert_ref_counts),
+                "exported_expert_payload_bytes_sum": sum(exported_expert_payload_bytes),
+                "candidate_expansion_ratio": (
+                    sum(exported_token_counts) / max_exported_tokens if max_exported_tokens else None
+                ),
+            },
+        )
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:

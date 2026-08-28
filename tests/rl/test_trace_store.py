@@ -8,6 +8,8 @@ import ray
 from xtuner.v1.rl.rollout import trace_store as trace_store_module
 from xtuner.v1.rl.rollout.trace_store import (
     RolloutTraceStore,
+    TokenizedSegment,
+    Trie,
     _free_ray_refs,
     get_existing_store,
     release_and_discard_rollout_groups,
@@ -51,6 +53,94 @@ class TestRolloutTraceCleanup(unittest.TestCase):
         ):
             self.assertIsNone(get_existing_store())
             self.assertIsNone(trace_store_module._handle_cache)
+
+
+class TestTrieObservability(unittest.TestCase):
+    def test_stats_count_trace_volume_without_exposing_contents(self):
+        trie = Trie()
+        trie.insert(
+            "prompt",
+            TokenizedSegment(
+                text="prompt",
+                token_ids=[1, 2],
+                expert_key=object(),
+                expert_nbytes=16,
+            ),
+        )
+        trie.insert(
+            "promptresponse",
+            TokenizedSegment(
+                text="response",
+                token_ids=[3, 4, 5],
+                labels=[3, -100, 5],
+                expert_key=object(),
+                expert_nbytes=24,
+            ),
+        )
+
+        self.assertEqual(
+            trie.stats(),
+            {
+                "tree_node_count": 2,
+                "value_node_count": 2,
+                "leaf_value_count": 1,
+                "branch_node_count": 0,
+                "token_segment_count": 2,
+                "token_count": 5,
+                "action_token_count": 2,
+                "expert_ref_count": 2,
+                "expert_payload_bytes": 40,
+                "text_chars": 14,
+            },
+        )
+
+
+class TestRolloutTraceStoreObservability(unittest.TestCase):
+    def test_snapshot_tracks_live_and_exported_volume(self):
+        store_class = RolloutTraceStore.__ray_metadata__.modified_class
+        store = store_class()
+        store.insert(
+            "observed",
+            "prompt",
+            TokenizedSegment(
+                text="prompt",
+                token_ids=[1, 2],
+                expert_key=object(),
+                expert_nbytes=16,
+            ),
+        )
+        store.insert(
+            "observed",
+            "promptresponse",
+            TokenizedSegment(
+                text="response",
+                token_ids=[3, 4],
+                labels=[3, 4],
+                expert_key=object(),
+                expert_nbytes=24,
+            ),
+        )
+
+        exported = store.export_training_trace("observed", "promptresponse")
+        snapshot = store.get_observability_snapshot("observed")
+
+        self.assertEqual(exported["input_ids"], [1, 2, 3, 4])
+        self.assertEqual(snapshot["live_session_count"], 1)
+        self.assertEqual(snapshot["trace_totals"]["token_segment_count"], 2)
+        self.assertEqual(snapshot["trace_totals"]["token_count"], 4)
+        self.assertEqual(snapshot["trace_totals"]["action_token_count"], 2)
+        self.assertEqual(snapshot["export_totals"]["calls"], 1)
+        self.assertEqual(snapshot["export_totals"]["tokens"], 4)
+        self.assertEqual(snapshot["export_totals"]["expert_refs"], 2)
+        self.assertEqual(snapshot["export_totals"]["expert_payload_bytes"], 40)
+        self.assertEqual(snapshot["requested_session"]["token_count"], 4)
+        self.assertEqual(snapshot["top_sessions"][0]["session_id"], "observed")
+        self.assertGreater(snapshot["resource"]["actor_rss_bytes"], 0)
+
+        store.release("observed")
+        released_snapshot = store.get_observability_snapshot("observed")
+        self.assertEqual(released_snapshot["live_session_count"], 0)
+        self.assertIsNone(released_snapshot["requested_session"])
 
 
 class TestRolloutTraceStore(unittest.TestCase):
