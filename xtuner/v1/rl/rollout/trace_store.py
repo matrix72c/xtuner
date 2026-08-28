@@ -590,6 +590,10 @@ class RolloutTraceStore:
             ValueError: If the prompt_text does not completely match the trace keys in the session.
         """
         started_at = time.perf_counter()
+        get_logger().info(
+            f"[TraceStoreExport] "
+            f"{json.dumps({'prompt_chars': len(prompt_text), 'session_id': session_id, 'status': 'start'}, sort_keys=True, separators=(',', ':'))}"
+        )
         trie = self.get_or_create(session_id)
         key, nodes = trie.search(prompt_text, filter_none=True)
         if prompt_text != key:
@@ -633,7 +637,10 @@ class RolloutTraceStore:
             expert_payload_bytes += node_val.expert_nbytes
         trace["routed_experts"] = _resolve_routed_experts(expert_keys, session_id)
         expert_ref_count = sum(expert_key is not None for expert_key in expert_keys)
-        trace["_trace_metrics"] = {
+        export_metrics = {
+            "duration_ms": (time.perf_counter() - started_at) * 1000,
+            "session_id": session_id,
+            "status": "ok",
             "token_count": len(trace["input_ids"]),
             "action_token_count": action_tokens,
             "expert_ref_count": expert_ref_count,
@@ -644,6 +651,7 @@ class RolloutTraceStore:
         self.exported_action_tokens += action_tokens
         self.exported_expert_refs += expert_ref_count
         self.exported_expert_payload_bytes += expert_payload_bytes
+        get_logger().info(f"[TraceStoreExport] {json.dumps(export_metrics, sort_keys=True, separators=(',', ':'))}")
         self._log_observability(
             "export",
             session_id=session_id,
@@ -653,7 +661,7 @@ class RolloutTraceStore:
                 "action_token_count": action_tokens,
                 "expert_ref_count": expert_ref_count,
                 "expert_payload_bytes": expert_payload_bytes,
-                "duration_ms": (time.perf_counter() - started_at) * 1000,
+                "duration_ms": export_metrics["duration_ms"],
             },
         )
         return trace

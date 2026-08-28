@@ -4,7 +4,6 @@ import asyncio
 import copy
 import importlib
 import json
-import time
 import traceback
 import uuid
 from typing import Any, Literal
@@ -302,6 +301,20 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_item.uid = rollout_state.session_id
             rollout_item.group_id = rollout_state.group_id
             result = await self._run_item(rollout_item)
+            if self.mode == "train" and result.status == RolloutStatus.COMPLETED:
+                raw_trace = _load_messages_artifact(result.artifacts)
+                assert raw_trace is not None
+                segments = _load_train_trace_segments(result.artifacts)
+                _log_agent_trace_metrics(
+                    "AgentTraceRecords",
+                    {
+                        "session_id": str(rollout_state.session_id),
+                        **_summarize_train_trace_segments(
+                            segments,
+                            artifact_record_count=len(raw_trace),
+                        ),
+                    },
+                )
             return await self._build_rollout_states(rollout_state, result)
         except Exception as exc:
             rollout_state.status = Status.COMPLETED if self.mode == "eval" else Status.FAILED
@@ -348,48 +361,16 @@ class AgentInSandboxLoop(AgentLoop):
         if item.status != RolloutStatus.COMPLETED:
             return [rollout_state]
 
-        raw_trace = _load_messages_artifact(item.artifacts)
-        assert raw_trace is not None
         segments = _load_train_trace_segments(item.artifacts)
         if not segments:
             raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-
-        session_id = str(rollout_state.session_id)
-        record_summary = {
-            "session_id": session_id,
-            **_summarize_train_trace_segments(
-                segments,
-                artifact_record_count=len(raw_trace),
-            ),
-        }
-        _log_agent_trace_metrics("AgentTraceRecords", record_summary)
 
         rollout_states: list[RolloutState] = []
         trace_store = get_store()
         for segment_index, (messages, tools) in enumerate(segments):
             if not messages:
                 raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-            state_copy_started_at = time.perf_counter()
-            _log_agent_trace_metrics(
-                "AgentTraceStateCopy",
-                {
-                    "session_id": session_id,
-                    "segment_index": segment_index,
-                    "segment_count": len(segments),
-                    "status": "start",
-                },
-            )
             segment_state = rollout_state.model_copy(deep=True)
-            _log_agent_trace_metrics(
-                "AgentTraceStateCopy",
-                {
-                    "session_id": session_id,
-                    "segment_index": segment_index,
-                    "segment_count": len(segments),
-                    "duration_ms": (time.perf_counter() - state_copy_started_at) * 1000,
-                    "status": "ok",
-                },
-            )
             segment_state.extra_fields["agent_messages"] = messages
             segment_state.extra_fields["agent_tools"] = tools
             segment_state.extra_fields["agent_tool_turns"] = _count_tool_turns(messages)
@@ -404,57 +385,7 @@ class AgentInSandboxLoop(AgentLoop):
                 add_generation_prompt=False,
             )
             prompt_text = text[:-1] if text.endswith("\n") else text
-            _log_agent_trace_metrics(
-                "AgentTraceExport",
-                {
-                    "session_id": session_id,
-                    "segment_index": segment_index,
-                    "segment_count": len(segments),
-                    "prompt_chars": len(prompt_text),
-                    "status": "start",
-                },
-            )
-            export_started_at = time.perf_counter()
-            try:
-                data = await trace_store.export_training_trace.remote(session_id, prompt_text)
-            except Exception as exc:
-                _log_agent_trace_metrics(
-                    "AgentTraceExport",
-                    {
-                        "session_id": session_id,
-                        "segment_index": segment_index,
-                        "segment_count": len(segments),
-                        "prompt_chars": len(prompt_text),
-                        "duration_ms": (time.perf_counter() - export_started_at) * 1000,
-                        "status": "error",
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                raise
-            routed_experts = data["routed_experts"]
-            trace_metrics = data.get("_trace_metrics", {})
-            action_token_count = trace_metrics.get("action_token_count")
-            if action_token_count is None:
-                action_token_count = sum(label != -100 for label in data["labels"])
-            expert_ref_count = trace_metrics.get("expert_ref_count")
-            if expert_ref_count is None:
-                expert_ref_count = len(routed_experts) if isinstance(routed_experts, list) else 0
-            expert_payload_bytes = trace_metrics.get("expert_payload_bytes", 0)
-            _log_agent_trace_metrics(
-                "AgentTraceExport",
-                {
-                    "session_id": session_id,
-                    "segment_index": segment_index,
-                    "segment_count": len(segments),
-                    "prompt_chars": len(prompt_text),
-                    "token_count": len(data["input_ids"]),
-                    "action_token_count": action_token_count,
-                    "expert_ref_count": expert_ref_count,
-                    "expert_payload_bytes": expert_payload_bytes,
-                    "duration_ms": (time.perf_counter() - export_started_at) * 1000,
-                    "status": "ok",
-                },
-            )
+            data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
             segment_state.input_ids = data["input_ids"]
             segment_state.labels = data["labels"]
             # Agentic training consumes input_ids/labels directly. response_ids is
@@ -469,7 +400,7 @@ class AgentInSandboxLoop(AgentLoop):
             # TODO(incomplete): a MoE run that produced routed experts for *no* node collapses to ``None`` here and is
             # indistinguishable from a dense trace; catching that would need the MoE-vs-dense signal the loop lacks
             # (session_server gates on ``enable_return_routed_experts``).
-            segment_state.routed_experts = routed_experts
+            segment_state.routed_experts = data["routed_experts"]
             if segment_state.response_ids:
                 segment_state.response = self.tokenizer.decode(segment_state.response_ids)
             else:
