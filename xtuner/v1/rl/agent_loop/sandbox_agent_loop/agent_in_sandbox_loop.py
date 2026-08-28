@@ -15,7 +15,6 @@ from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.utils import create_task
-from xtuner.v1.utils import get_logger
 
 from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
@@ -135,6 +134,8 @@ def _summarize_train_trace_segments(
 
 
 def _log_agent_trace_metrics(kind: str, payload: dict[str, Any]) -> None:
+    from xtuner.v1.utils import get_logger
+
     get_logger().info(f"[{kind}] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}")
 
 
@@ -339,8 +340,6 @@ class AgentInSandboxLoop(AgentLoop):
                     artifact_record_count=len(raw_trace),
                 ),
             }
-            # Emit this before copying the full artifact into RolloutState. If the artifact is already very large,
-            # the shape report still survives even when the subsequent copy or export exhausts the worker.
             _log_agent_trace_metrics("AgentTraceRecords", record_summary)
 
         response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
@@ -354,23 +353,7 @@ class AgentInSandboxLoop(AgentLoop):
         if selected_agent is not None:
             rollout_state.extra_fields["agent_name"] = selected_agent.get("name")
             rollout_state.extra_fields["agent_selected"] = _to_json_safe(selected_agent)
-        artifact_copy_started_at = time.perf_counter()
-        _log_agent_trace_metrics(
-            "AgentTraceArtifactCopy",
-            {
-                "session_id": str(rollout_state.session_id),
-                "status": "start",
-            },
-        )
         rollout_state.extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
-        _log_agent_trace_metrics(
-            "AgentTraceArtifactCopy",
-            {
-                "session_id": str(rollout_state.session_id),
-                "duration_ms": (time.perf_counter() - artifact_copy_started_at) * 1000,
-                "status": "ok",
-            },
-        )
         rollout_state.extra_fields["agent_judgers"] = {
             name: record.model_dump(mode="json") for name, record in item.judgers.items()
         }

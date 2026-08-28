@@ -132,7 +132,6 @@ def test_build_rollout_states_logs_each_materialized_prefix_and_summary():
     calls = [(call.args[0], call.args[1]) for call in log_metrics.call_args_list]
     assert calls[0][0] == "AgentTraceRecords"
     assert calls[-1][0] == "AgentTraceSummary"
-    assert [payload.get("status") for kind, payload in calls if kind == "AgentTraceArtifactCopy"] == ["start", "ok"]
     assert [payload.get("status") for kind, payload in calls if kind == "AgentTraceStateCopy"] == [
         "start",
         "ok",
