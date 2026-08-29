@@ -490,6 +490,8 @@ class SessionServer:
 
         delta_expert: Any = None
         response_expert: Any = None
+        delta_expert_nbytes = 0
+        response_expert_nbytes = 0
         if raw_routed_expert is not None:
             raw_routed_expert = await self._decode_routed_experts(raw_routed_expert)
             if len(raw_routed_expert) > 0:
@@ -499,8 +501,12 @@ class SessionServer:
                 raw_routed_expert = np.concatenate([dummy_expert, raw_routed_expert], axis=0)
             assert prefix_len + delta_len + len(output_token_ids) == len(raw_routed_expert)
             if delta_len > 0:
-                delta_expert = ray.put(raw_routed_expert[prefix_len : prefix_len + delta_len])
-            response_expert = ray.put(raw_routed_expert[prefix_len + delta_len :])
+                delta_expert_array = raw_routed_expert[prefix_len : prefix_len + delta_len]
+                delta_expert_nbytes = delta_expert_array.nbytes
+                delta_expert = ray.put(delta_expert_array)
+            response_expert_array = raw_routed_expert[prefix_len + delta_len :]
+            response_expert_nbytes = response_expert_array.nbytes
+            response_expert = ray.put(response_expert_array)
         elif self.enable_return_routed_experts and _bool_request_value(
             orig_req_body.get("return_routed_experts"), True
         ):
@@ -517,7 +523,12 @@ class SessionServer:
             await self.store.insert.remote(
                 session_id,
                 key=old_prompt,
-                value=TokenizedSegment(text=delta_text, token_ids=delta_ids, expert_key=delta_expert),
+                value=TokenizedSegment(
+                    text=delta_text,
+                    token_ids=delta_ids,
+                    expert_key=delta_expert,
+                    expert_nbytes=delta_expert_nbytes,
+                ),
             )
         await self.store.insert.remote(
             session_id,
@@ -528,6 +539,7 @@ class SessionServer:
                 logprobs=output_logprobs,
                 labels=output_token_ids,
                 expert_key=response_expert,
+                expert_nbytes=response_expert_nbytes,
                 length=len(output_token_ids),
             ),
         )
