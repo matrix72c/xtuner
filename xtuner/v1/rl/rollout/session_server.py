@@ -22,9 +22,41 @@ FMT_ANTHROPIC = "anthropic"
 # Fields the SessionServer consumes locally and never forwards upstream.
 _SESSION_SERVER_ONLY_KEYS = {"session_id"}
 
+_ENDPOINT_ANTHROPIC_MESSAGES = "anthropic_messages"
+_ENDPOINT_ANTHROPIC_COUNT_TOKENS = "anthropic_count_tokens"
+_ENDPOINT_OPENAI_CHAT_COMPLETIONS = "openai_chat_completions"
+_ENDPOINT_OPENAI_RESPONSES = "openai_responses"
+_ENDPOINT_HELLO = "hello"
+
+
+def _normalize_path(req_path: str) -> str:
+    """Return a leading-slash path without a query string."""
+    return "/" + req_path.split("?", 1)[0].lstrip("/")
+
+
+def _classify_endpoint(method: str, req_path: str) -> Optional[str]:
+    """Classify the small HTTP surface SessionServer deliberately exposes."""
+    path = _normalize_path(req_path)
+    method = method.upper()
+
+    if method == "HEAD" and path.endswith("/api/hello"):
+        return _ENDPOINT_HELLO
+    if method != "POST":
+        return None
+    if path.endswith("/v1/messages/count_tokens"):
+        return _ENDPOINT_ANTHROPIC_COUNT_TOKENS
+    if path.endswith("/v1/messages"):
+        return _ENDPOINT_ANTHROPIC_MESSAGES
+    if path.endswith("/v1/chat/completions"):
+        return _ENDPOINT_OPENAI_CHAT_COMPLETIONS
+    if path.endswith("/v1/responses"):
+        return _ENDPOINT_OPENAI_RESPONSES
+    return None
+
 
 def _detect_format(req_path: str) -> str:
-    if req_path.endswith("/messages") or "/v1/messages" in req_path:
+    path = _normalize_path(req_path)
+    if path.endswith("/v1/messages") or path.endswith("/v1/messages/count_tokens"):
         return FMT_ANTHROPIC
     return FMT_OPENAI
 
@@ -533,10 +565,14 @@ class SessionServer:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
         req_path = request.match_info["path"]
+        endpoint = _classify_endpoint(request.method, req_path)
         fmt = _detect_format(req_path)
 
+        if endpoint == _ENDPOINT_HELLO:
+            return web.Response(status=HTTPStatus.NO_CONTENT)
+
         # Reject /v1/responses outright — upstream worker doesn't implement it.
-        if req_path.endswith("/responses") or "/v1/responses" in req_path:
+        if endpoint == _ENDPOINT_OPENAI_RESPONSES:
             return web.json_response(
                 _error_payload(
                     fmt,
@@ -547,6 +583,24 @@ class SessionServer:
                 status=HTTPStatus.NOT_IMPLEMENTED,
             )
 
+        if endpoint is None:
+            path = _normalize_path(req_path)
+            get_logger().warning(f"SessionServer rejected unsupported endpoint: method={request.method} path={path}")
+            return web.json_response(
+                _error_payload(
+                    fmt,
+                    f"{request.method} {path} is not supported by SessionServer.",
+                    status=HTTPStatus.NOT_FOUND,
+                    error_type="not_found_error",
+                ),
+                status=HTTPStatus.NOT_FOUND,
+            )
+
+        is_generation = endpoint in {
+            _ENDPOINT_ANTHROPIC_MESSAGES,
+            _ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        }
+
         # Read the request body
         request_body = await request.read()
         request_data = None
@@ -554,9 +608,30 @@ class SessionServer:
         trace_enabled = False
         orig_return_logprob = orig_return_token_ids = False
         orig_return_routed_experts = True
-        if request_body:
+        if request_body and not is_generation:
             try:
                 request_data = json.loads(request_body)
+                if isinstance(request_data, dict):
+                    # Non-generation endpoints are transparent. Only strip
+                    # fields owned by SessionServer for compatibility with
+                    # older SessionClient versions that injected them globally.
+                    forwarded_data = {
+                        key: value for key, value in request_data.items() if key not in _SESSION_SERVER_ONLY_KEYS
+                    }
+                    if forwarded_data != request_data:
+                        request_body = json.dumps(forwarded_data).encode("utf-8")
+                # Nothing after forwarding needs to inspect a non-generation
+                # request. Keeping this unset also prevents a stray ``stream``
+                # field from selecting the generation streaming path.
+                request_data = None
+            except json.JSONDecodeError:
+                pass
+
+        if request_body and is_generation:
+            try:
+                request_data = json.loads(request_body)
+                if not isinstance(request_data, dict):
+                    raise TypeError("generation request body must be a JSON object")
                 # Anthropic server-side built-ins (web_search_*, computer_*, ...)
                 # don't carry ``input_schema`` and the lmdeploy worker can't
                 # route them anyway — drop them before anything downstream
@@ -607,11 +682,15 @@ class SessionServer:
         # Build the per-format stream cleaner (strips lmdeploy-injected
         # extension fields that the client didn't ask for, and removes the
         # stop word from any user-visible text).
-        clean_data = self._build_data_cleaner(
-            fmt,
-            orig_return_logprob=orig_return_logprob,
-            orig_return_token_ids=orig_return_token_ids,
-            orig_return_routed_experts=orig_return_routed_experts,
+        clean_data = (
+            self._build_data_cleaner(
+                fmt,
+                orig_return_logprob=orig_return_logprob,
+                orig_return_token_ids=orig_return_token_ids,
+                orig_return_routed_experts=orig_return_routed_experts,
+            )
+            if is_generation
+            else None
         )
 
         timeout = ClientTimeout(total=self.request_timeout, sock_connect=30)
@@ -643,7 +722,7 @@ class SessionServer:
                         if trace_enabled:
                             response_chunks.append(line)
 
-                        if request_data is not None and line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
+                        if clean_data is not None and line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                             try:
                                 text = line.decode("utf-8")
                                 data = json.loads(text[6:])
@@ -664,7 +743,7 @@ class SessionServer:
                     raw_response = await resp.read()
                     final_raw_response = raw_response
 
-                    if request_data is not None:
+                    if clean_data is not None:
                         try:
                             parsed = json.loads(raw_response)
                             if clean_data(parsed):
