@@ -72,6 +72,15 @@ def _is_error_payload(payload: dict) -> bool:
     return payload.get("error") is not None or payload.get("type") == "error" or payload.get("object") == "error"
 
 
+async def _prepare_stream_response(response: web.StreamResponse, request: web.Request) -> bool:
+    """Prepare downstream streaming, returning false after an early disconnect."""
+    try:
+        await response.prepare(request)
+    except (ConnectionError, ClientConnectionResetError):
+        return False
+    return True
+
+
 def _error_payload(fmt: str, message: str, status: int = 500, error_type: str = "internal_server_error") -> dict:
     """Error body in the caller's native shape.
 
@@ -767,6 +776,8 @@ class SessionServer:
                 data=request_body,
                 trace_session_id=session_id,
             ) as resp:
+                upstream_status = resp.status
+                trace_response = trace_enabled and upstream_status < HTTPStatus.BAD_REQUEST
                 if is_stream:
                     response_chunks: list[bytes] = []
                     response = web.StreamResponse(
@@ -777,37 +788,38 @@ class SessionServer:
                             if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
                         },
                     )
-                    await response.prepare(request)
                     # If the downstream client closes the socket mid-stream
                     # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
                     # chunk after the prompt overflowed the session window),
                     # keep draining the upstream so the trace is still recorded
                     # in full but stop attempting to write to the closed socket.
-                    client_alive = True
+                    # This includes a disconnect before response headers are
+                    # prepared, not just one that happens between body chunks.
+                    client_alive = await _prepare_stream_response(response, request)
                     async for line in resp.content:
                         # Only retain chunks when we'll actually need to parse
                         # them for tracing; evaluate-mode requests skip this
                         # so memory does not grow with stream length.
-                        if trace_enabled:
+                        if trace_response:
                             response_chunks.append(line)
 
                         if clean_data is not None and line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                             try:
                                 text = line.decode("utf-8")
                                 data = json.loads(text[6:])
-                                if clean_data(data):
+                                if isinstance(data, dict) and not _is_error_payload(data) and clean_data(data):
                                     line = ("data: " + json.dumps(data) + "\n").encode("utf-8")
                             except Exception:
                                 pass
 
                         # Delay [DONE] only while a training trace still needs to be exported.
-                        if client_alive and (not trace_enabled or line.strip() != b"data: [DONE]"):
+                        if client_alive and (not trace_response or line.strip() != b"data: [DONE]"):
                             try:
                                 await response.write(line)
                             except (ConnectionError, ClientConnectionResetError):
                                 client_alive = False
 
-                    raw_response = b"".join(response_chunks) if trace_enabled else b""
+                    raw_response = b"".join(response_chunks) if trace_response else b""
                 else:
                     raw_response = await resp.read()
                     final_raw_response = raw_response
@@ -815,7 +827,7 @@ class SessionServer:
                     if clean_data is not None:
                         try:
                             parsed = json.loads(raw_response)
-                            if clean_data(parsed):
+                            if isinstance(parsed, dict) and not _is_error_payload(parsed) and clean_data(parsed):
                                 final_raw_response = json.dumps(parsed).encode("utf-8")
                         except Exception:
                             pass
@@ -832,9 +844,9 @@ class SessionServer:
 
         # Apply abstract on_response processing
         response_data: Optional[dict] = None
-        skip_done = bool(is_stream and not trace_enabled)
+        skip_done = bool(is_stream and not trace_response)
         session_error_msg: Optional[str] = None
-        if request_data and trace_enabled and orig_req_body is not None:
+        if request_data and trace_response and orig_req_body is not None:
             if is_stream:
                 try:
                     response_data = self._parse_stream_response(raw_response, fmt)
@@ -848,11 +860,15 @@ class SessionServer:
                     skip_done = True
             else:
                 try:
-                    response_data = json.loads(raw_response)
-                except json.JSONDecodeError:
-                    pass
-                if isinstance(response_data, dict) and _is_error_payload(response_data):
-                    response_data = None
+                    parsed_response = json.loads(raw_response)
+                    if not isinstance(parsed_response, dict):
+                        raise TypeError(
+                            f"generation response body must be a JSON object; got {type(parsed_response).__name__}"
+                        )
+                    if not _is_error_payload(parsed_response):
+                        response_data = parsed_response
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+                    session_error_msg = f"SessionServer response hook failed: {type(exc).__name__}: {exc}"
 
             if response_data is not None:
                 set_trace_attributes(_response_usage_attributes(response_data))
