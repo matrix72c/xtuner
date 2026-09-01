@@ -71,6 +71,15 @@ def _should_record_response(payload: dict, fmt: str, req_path: str) -> bool:
     return False
 
 
+async def _prepare_stream_response(response: web.StreamResponse, request: web.Request) -> bool:
+    """Prepare downstream streaming, returning false after an early disconnect."""
+    try:
+        await response.prepare(request)
+    except (ConnectionError, ClientConnectionResetError):
+        return False
+    return True
+
+
 def _error_payload(fmt: str, message: str, status: int = 500, error_type: str = "internal_server_error") -> dict:
     """Error body in the caller's native shape.
 
@@ -667,13 +676,14 @@ class SessionServer:
                             if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
                         },
                     )
-                    await response.prepare(request)
                     # If the downstream client closes the socket mid-stream
                     # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
                     # chunk after the prompt overflowed the session window),
                     # keep draining the upstream so the trace is still recorded
                     # in full but stop attempting to write to the closed socket.
-                    client_alive = True
+                    # This includes a disconnect before response headers are
+                    # prepared, not just one that happens between body chunks.
+                    client_alive = await _prepare_stream_response(response, request)
                     async for line in resp.content:
                         # Only retain chunks when we'll actually need to parse
                         # them for tracing; evaluate-mode requests skip this

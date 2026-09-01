@@ -1,10 +1,13 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from aiohttp import ClientConnectionResetError
 
 from xtuner.v1.rl.rollout.session_server import (
     FMT_ANTHROPIC,
     FMT_OPENAI,
     _is_assistant_response,
+    _prepare_stream_response,
     _should_record_response,
 )
 
@@ -64,6 +67,24 @@ class TestShouldRecordResponse(unittest.TestCase):
 
         self.assertTrue(should_record)
         logger.warning.assert_not_called()
+
+
+class TestPrepareStreamResponse(unittest.IsolatedAsyncioTestCase):
+    async def test_prepared_client_remains_alive(self):
+        response = unittest.mock.Mock()
+        response.prepare = AsyncMock(return_value=None)
+        request = unittest.mock.Mock()
+
+        self.assertTrue(await _prepare_stream_response(response, request))
+        response.prepare.assert_awaited_once_with(request)
+
+    async def test_disconnect_before_headers_marks_client_dead(self):
+        response = unittest.mock.Mock()
+        response.prepare = AsyncMock(side_effect=ClientConnectionResetError("closing transport"))
+        request = unittest.mock.Mock()
+
+        self.assertFalse(await _prepare_stream_response(response, request))
+        response.prepare.assert_awaited_once_with(request)
 
 
 if __name__ == "__main__":
