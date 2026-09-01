@@ -40,6 +40,53 @@ def _is_error_payload(payload: dict) -> bool:
     return payload.get("error") is not None or payload.get("type") == "error" or payload.get("object") == "error"
 
 
+def _is_assistant_response(payload: dict, fmt: str) -> bool:
+    """Whether a successful payload contains an assistant generation.
+
+    A SessionClient can proxy non-generation endpoints through the same server.
+    Some of those requests still carry a ``messages`` field, so request shape
+    alone is not enough to decide whether the response belongs in the training
+    trace. Keep malformed *generation* responses traceable so ``on_response``
+    can fail closed on missing token/logprob extensions; only skip envelopes
+    that do not contain an assistant response at all.
+    """
+    if fmt == FMT_ANTHROPIC:
+        return (
+            payload.get("type") == "message"
+            and payload.get("role") == "assistant"
+            and isinstance(payload.get("content"), list)
+        )
+
+    choices = payload.get("choices")
+    return bool(
+        isinstance(choices, list)
+        and choices
+        and isinstance(choices[0], dict)
+        and isinstance(choices[0].get("message"), dict)
+    )
+
+
+def _should_record_response(payload: dict, fmt: str, req_path: str) -> bool:
+    """Return false, with safe diagnostics, for non-generation envelopes."""
+    if _is_assistant_response(payload, fmt):
+        return True
+    get_logger().warning(
+        "SessionServer skipped non-assistant response for trace: "
+        f"path=/{req_path.lstrip('/')} format={fmt} "
+        f"response_keys={sorted(payload)}"
+    )
+    return False
+
+
+async def _prepare_stream_response(response: web.StreamResponse, request: web.Request) -> bool:
+    """Prepare downstream streaming, returning false after an early disconnect."""
+    try:
+        await response.prepare(request)
+    except (ConnectionError, ClientConnectionResetError):
+        return False
+    return True
+
+
 def _error_payload(fmt: str, message: str, status: int = 500, error_type: str = "internal_server_error") -> dict:
     """Error body in the caller's native shape.
 
@@ -710,13 +757,14 @@ class SessionServer:
                             if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
                         },
                     )
-                    await response.prepare(request)
                     # If the downstream client closes the socket mid-stream
                     # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
                     # chunk after the prompt overflowed the session window),
                     # keep draining the upstream so the trace is still recorded
                     # in full but stop attempting to write to the closed socket.
-                    client_alive = True
+                    # This includes a disconnect before response headers are
+                    # prepared, not just one that happens between body chunks.
+                    client_alive = await _prepare_stream_response(response, request)
                     async for line in resp.content:
                         # Only retain chunks when we'll actually need to parse
                         # them for tracing; evaluate-mode requests skip this
@@ -786,6 +834,9 @@ class SessionServer:
                     pass
                 if isinstance(response_data, dict) and _is_error_payload(response_data):
                     response_data = None
+
+            if response_data is not None and not _should_record_response(response_data, fmt, req_path):
+                response_data = None
 
             if response_data is not None:
                 set_trace_attributes(_response_usage_attributes(response_data))
