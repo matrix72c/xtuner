@@ -1,7 +1,13 @@
+import json
+import math
+import os
+import socket
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
 import ray
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,6 +18,69 @@ from xtuner.v1.utils import get_logger
 _STORE_NAME = "rollout_trace_store"
 _STORE_NAMESPACE = "xtuner_rollout"
 _handle_cache: Any = None
+_DEFAULT_METRICS_INTERVAL_SEC = 30.0
+
+
+def _metrics_interval_sec() -> float:
+    raw_value = os.getenv("XTUNER_TRACE_METRICS_INTERVAL_SEC", str(_DEFAULT_METRICS_INTERVAL_SEC))
+    try:
+        interval = float(raw_value)
+    except ValueError:
+        return _DEFAULT_METRICS_INTERVAL_SEC
+    return interval if math.isfinite(interval) and interval >= 1.0 else _DEFAULT_METRICS_INTERVAL_SEC
+
+
+def _read_cgroup_memory() -> dict[str, Any]:
+    """Read cgroup-v2 memory counters without failing the trace actor."""
+    root = Path("/sys/fs/cgroup")
+    result: dict[str, Any] = {}
+    for name in ("memory.current", "memory.max"):
+        try:
+            raw_value = (root / name).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        result[name.replace(".", "_")] = int(raw_value) if raw_value.isdigit() else raw_value
+
+    try:
+        event_lines = (root / "memory.events").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        event_lines = []
+    for line in event_lines:
+        key, _, value = line.partition(" ")
+        if key and value.isdigit():
+            result[f"memory_event_{key}"] = int(value)
+    return result
+
+
+def _resource_snapshot(process: psutil.Process) -> dict[str, Any]:
+    """Return small, JSON-safe process/node counters for incident diagnosis."""
+    try:
+        process_memory = process.memory_info()
+        process_cpu_percent = process.cpu_percent(interval=None)
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        process_memory = None
+        process_cpu_percent = None
+    node_memory = psutil.virtual_memory()
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+    except OSError:
+        load_1m = load_5m = load_15m = None
+
+    snapshot: dict[str, Any] = {
+        "actor_pid": os.getpid(),
+        "actor_hostname": socket.gethostname(),
+        "actor_rss_bytes": process_memory.rss if process_memory is not None else None,
+        "actor_vms_bytes": process_memory.vms if process_memory is not None else None,
+        "actor_cpu_percent": process_cpu_percent,
+        "node_memory_total_bytes": node_memory.total,
+        "node_memory_available_bytes": node_memory.available,
+        "node_memory_percent": node_memory.percent,
+        "node_load_1m": load_1m,
+        "node_load_5m": load_5m,
+        "node_load_15m": load_15m,
+    }
+    snapshot.update(_read_cgroup_memory())
+    return snapshot
 
 
 def _free_ray_refs(obj: Any):
@@ -103,7 +172,9 @@ class TokenizedSegment(BaseModel):
     labels: List[int] | None = Field(default=None, repr=False)
     logprobs: List[float] | None = Field(default=None, repr=False)
     expert_key: Any = Field(default=None, repr=False)
+    expert_nbytes: int = Field(default=0, ge=0)
     length: int | None = None
+    action_token_count: int | None = Field(default=None, ge=0)
 
     def model_post_init(self, _):
         if self.labels is None:
@@ -112,6 +183,8 @@ class TokenizedSegment(BaseModel):
             self.logprobs = [0.0] * len(self.token_ids)
         if self.length is None:
             self.length = len(self.token_ids)
+        if self.action_token_count is None:
+            self.action_token_count = sum(label != -100 for label in self.labels)
         assert len(self.token_ids) == len(self.labels) == len(self.logprobs)
 
 
@@ -148,6 +221,44 @@ class Trie:
                 _collect(child, path + [token])
 
         _collect(self.root, [])
+        return result
+
+    def stats(self) -> dict[str, int]:
+        """Summarize stored nodes without scanning per-token arrays."""
+        result = {
+            "tree_node_count": 0,
+            "value_node_count": 0,
+            "leaf_value_count": 0,
+            "branch_node_count": 0,
+            "token_segment_count": 0,
+            "token_count": 0,
+            "action_token_count": 0,
+            "expert_ref_count": 0,
+            "expert_payload_bytes": 0,
+            "text_chars": 0,
+        }
+
+        def _collect(node: TreeNode) -> None:
+            if len(node.children) > 1:
+                result["branch_node_count"] += 1
+            for edge, child in node.children.items():
+                result["tree_node_count"] += 1
+                result["text_chars"] += len(edge)
+                if child.value is not None:
+                    result["value_node_count"] += 1
+                    if not child.children:
+                        result["leaf_value_count"] += 1
+                    if isinstance(child.value, TokenizedSegment):
+                        segment = child.value
+                        result["token_segment_count"] += 1
+                        result["token_count"] += len(segment.token_ids)
+                        result["action_token_count"] += segment.action_token_count or 0
+                        if segment.expert_key is not None:
+                            result["expert_ref_count"] += 1
+                        result["expert_payload_bytes"] += segment.expert_nbytes
+                _collect(child)
+
+        _collect(self.root)
         return result
 
     def insert(self, key: str, value: Any) -> None:
@@ -269,6 +380,92 @@ class RolloutTraceStore:
         self.sessions: Dict[str, Trie] = {}
         self.objects: Dict[str, ray.ObjectRef] = {}
         self.updated_at: Dict[str, float] = {}
+        self.created_at = time.time()
+        self.export_calls = 0
+        self.exported_tokens = 0
+        self.exported_action_tokens = 0
+        self.exported_expert_refs = 0
+        self.exported_expert_payload_bytes = 0
+        self._metrics_interval_sec = _metrics_interval_sec()
+        self._last_metrics_log_at = 0.0
+        self._process = psutil.Process(os.getpid())
+        self._process.cpu_percent(interval=None)
+
+    def _session_stats(self) -> dict[str, dict[str, Any]]:
+        return {
+            session_id: {
+                **trie.stats(),
+                "updated_at": self.updated_at.get(session_id),
+            }
+            for session_id, trie in self.sessions.items()
+        }
+
+    def get_observability_snapshot(self, session_id: str | None = None) -> dict[str, Any]:
+        """Return trace volume and local resource counters without trace contents."""
+        sessions = self._session_stats()
+        numeric_fields = (
+            "tree_node_count",
+            "value_node_count",
+            "leaf_value_count",
+            "branch_node_count",
+            "token_segment_count",
+            "token_count",
+            "action_token_count",
+            "expert_ref_count",
+            "expert_payload_bytes",
+            "text_chars",
+        )
+        totals = {field: sum(stats[field] for stats in sessions.values()) for field in numeric_fields}
+        top_sessions = sorted(
+            (
+                {
+                    "session_id": current_session_id,
+                    "token_count": stats["token_count"],
+                    "action_token_count": stats["action_token_count"],
+                    "expert_payload_bytes": stats["expert_payload_bytes"],
+                    "expert_ref_count": stats["expert_ref_count"],
+                    "token_segment_count": stats["token_segment_count"],
+                }
+                for current_session_id, stats in sessions.items()
+            ),
+            key=lambda item: (item["expert_payload_bytes"], item["token_count"]),
+            reverse=True,
+        )[:5]
+        return {
+            "timestamp": time.time(),
+            "actor_uptime_sec": time.time() - self.created_at,
+            "live_session_count": len(sessions),
+            "trace_totals": totals,
+            "export_totals": {
+                "calls": self.export_calls,
+                "tokens": self.exported_tokens,
+                "action_tokens": self.exported_action_tokens,
+                "expert_refs": self.exported_expert_refs,
+                "expert_payload_bytes": self.exported_expert_payload_bytes,
+            },
+            "requested_session": sessions.get(session_id) if session_id is not None else None,
+            "top_sessions": top_sessions,
+            "resource": _resource_snapshot(self._process),
+        }
+
+    def _log_observability(
+        self,
+        event: str,
+        *,
+        session_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_metrics_log_at < self._metrics_interval_sec:
+            return
+        self._last_metrics_log_at = now
+        payload = self.get_observability_snapshot(session_id)
+        payload["event"] = event
+        if session_id is not None:
+            payload["session_id"] = session_id
+        if details:
+            payload["details"] = details
+        get_logger().info(f"[TraceStoreMetrics] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}")
 
     def get_or_create(self, session_id: str) -> Trie:
         """Get the Trie for a session, or create one if it doesn't exist.
@@ -308,7 +505,10 @@ class RolloutTraceStore:
             value (Any): The trace segment/value to store.
         """
         trie = self.get_or_create(session_id)
-        return trie.insert(key, value)
+        result = trie.insert(key, value)
+        self.updated_at[session_id] = time.time()
+        self._log_observability("insert", session_id=session_id)
+        return result
 
     def search(self, session_id: str, text: str, filter_none: bool = False):
         """Search the longest prefix in a session's Trie.
@@ -334,7 +534,21 @@ class RolloutTraceStore:
         """
         assert session_id in self.sessions, f"Session ID '{session_id}' not found for release."
         trie = self.sessions.pop(session_id) if key is None else self.sessions[session_id]
+        before_release = trie.stats()
         trie.release(key)
+        if key is None:
+            self.updated_at.pop(session_id, None)
+        else:
+            self.updated_at[session_id] = time.time()
+        self._log_observability(
+            "release",
+            session_id=session_id,
+            details={
+                "full_session": key is None,
+                "before_release": before_release,
+                "after_release": None if key is None else trie.stats(),
+            },
+        )
 
     def release_sessions(self, session_ids: list[str]) -> list[str]:
         """Release existing trace sessions in one actor call.
@@ -375,6 +589,11 @@ class RolloutTraceStore:
         Raises:
             ValueError: If the prompt_text does not completely match the trace keys in the session.
         """
+        started_at = time.perf_counter()
+        get_logger().info(
+            f"[TraceStoreExport] "
+            f"{json.dumps({'prompt_chars': len(prompt_text), 'session_id': session_id, 'status': 'start'}, sort_keys=True, separators=(',', ':'))}"
+        )
         trie = self.get_or_create(session_id)
         key, nodes = trie.search(prompt_text, filter_none=True)
         if prompt_text != key:
@@ -402,6 +621,8 @@ class RolloutTraceStore:
             )
         trace: dict[str, Any] = {"input_ids": [], "labels": [], "logprobs": []}
         expert_keys: list[Any] = []
+        action_tokens = 0
+        expert_payload_bytes = 0
         for node in nodes:
             node_val = node.value
             if not isinstance(node_val, TokenizedSegment):
@@ -412,7 +633,37 @@ class RolloutTraceStore:
             trace["labels"].extend(node_val.labels)
             trace["logprobs"].extend(node_val.logprobs)
             expert_keys.append(node_val.expert_key)
+            action_tokens += node_val.action_token_count or 0
+            expert_payload_bytes += node_val.expert_nbytes
         trace["routed_experts"] = _resolve_routed_experts(expert_keys, session_id)
+        expert_ref_count = sum(expert_key is not None for expert_key in expert_keys)
+        export_metrics = {
+            "duration_ms": (time.perf_counter() - started_at) * 1000,
+            "session_id": session_id,
+            "status": "ok",
+            "token_count": len(trace["input_ids"]),
+            "action_token_count": action_tokens,
+            "expert_ref_count": expert_ref_count,
+            "expert_payload_bytes": expert_payload_bytes,
+        }
+        self.export_calls += 1
+        self.exported_tokens += len(trace["input_ids"])
+        self.exported_action_tokens += action_tokens
+        self.exported_expert_refs += expert_ref_count
+        self.exported_expert_payload_bytes += expert_payload_bytes
+        get_logger().info(f"[TraceStoreExport] {json.dumps(export_metrics, sort_keys=True, separators=(',', ':'))}")
+        self._log_observability(
+            "export",
+            session_id=session_id,
+            details={
+                "prompt_chars": len(prompt_text),
+                "token_count": len(trace["input_ids"]),
+                "action_token_count": action_tokens,
+                "expert_ref_count": expert_ref_count,
+                "expert_payload_bytes": expert_payload_bytes,
+                "duration_ms": export_metrics["duration_ms"],
+            },
+        )
         return trace
 
     def get_objects(self, keys: list[str]) -> list[ray.ObjectRef]:

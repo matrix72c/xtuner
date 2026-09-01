@@ -96,6 +96,49 @@ def _load_train_trace_segments(artifacts: dict[str, Any]) -> list[tuple[list[dic
     return segments
 
 
+def _json_identity(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _summarize_train_trace_segments(
+    segments: list[tuple[list[dict[str, Any]], Any]],
+    *,
+    artifact_record_count: int,
+) -> dict[str, Any]:
+    """Describe record shape without logging message or tool contents."""
+    message_counts = [len(messages) for messages, _ in segments]
+    assistant_message_counts = [
+        sum(message.get("role") == "assistant" for message in messages) for messages, _ in segments
+    ]
+    tool_identities = {_json_identity(tools) for _, tools in segments}
+
+    if len(segments) <= 1:
+        record_shape = "single"
+    elif len(tool_identities) > 1:
+        record_shape = "tools_changed"
+    else:
+        ordered_messages = sorted((messages for messages, _ in segments), key=len)
+        is_prefix_chain = all(
+            shorter == longer[: len(shorter)] for shorter, longer in zip(ordered_messages, ordered_messages[1:])
+        )
+        record_shape = "linear_prefix_or_duplicate" if is_prefix_chain else "branch_or_rewrite"
+
+    return {
+        "artifact_record_count": artifact_record_count,
+        "train_segment_count": len(segments),
+        "record_shape": record_shape,
+        "message_counts": message_counts,
+        "assistant_message_counts": assistant_message_counts,
+        "tool_variant_count": len(tool_identities),
+    }
+
+
+def _log_agent_trace_metrics(kind: str, payload: dict[str, Any]) -> None:
+    from xtuner.v1.utils import get_logger
+
+    get_logger().info(f"[{kind}] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}")
+
+
 def _load_eval_trace_segment(artifacts: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
     trace = _load_messages_artifact(artifacts, required=False)
     if not trace:
@@ -262,6 +305,20 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_item.uid = rollout_state.session_id
             rollout_item.group_id = rollout_state.group_id
             result = await self._run_item(rollout_item)
+            if self.mode == "train" and result.status == RolloutStatus.COMPLETED:
+                raw_trace = _load_messages_artifact(result.artifacts)
+                assert raw_trace is not None
+                segments = _load_train_trace_segments(result.artifacts)
+                _log_agent_trace_metrics(
+                    "AgentTraceRecords",
+                    {
+                        "session_id": str(rollout_state.session_id),
+                        **_summarize_train_trace_segments(
+                            segments,
+                            artifact_record_count=len(raw_trace),
+                        ),
+                    },
+                )
             return await self._build_rollout_states(rollout_state, result)
         except Exception as exc:
             rollout_state.status = Status.COMPLETED if self.mode == "eval" else Status.FAILED
