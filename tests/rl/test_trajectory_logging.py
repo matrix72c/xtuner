@@ -144,6 +144,23 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.status, Status.FAILED)
         self.assertEqual(state.extra_fields["agent_artifacts"], item.artifacts)
 
+    async def test_completed_timeout_session_becomes_failed_without_trace(self):
+        loop = self._make_loop()
+        state = self._make_state()
+        item = self._make_item(RolloutStatus.COMPLETED, segment_count=0)
+        item.artifacts["response_message"] = {
+            "content": "",
+            "finish_reason": "timeout",
+        }
+
+        segments = await loop._build_rollout_states(state, item)
+
+        self.assertEqual(segments, [state])
+        self.assertEqual(state.status, Status.FAILED)
+        self.assertEqual(state.finish_reason, "timeout")
+        self.assertEqual(state.error_msg, "TimeoutError: agent exceeded the configured timeout")
+        self.assertEqual(state.extra_fields["agent_artifacts"], item.artifacts)
+
     async def test_eval_session_keeps_artifacts(self):
         loop = self._make_loop(mode="eval")
         state = self._make_state()
