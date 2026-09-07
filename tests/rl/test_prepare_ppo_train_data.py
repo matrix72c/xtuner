@@ -120,7 +120,8 @@ class TestPreparePPOTrainData(unittest.TestCase):
         self.assertTrue(all(value == 0.0 for value in advantage), advantage)
 
     def test_uniform_reward_group_is_still_trained_on(self):
-        """A learned baseline gives signal where a group baseline gives none."""
+        """A learned baseline gives signal where a group baseline gives
+        none."""
         trainer = self._build_trainer()
         group = [self._state(uid=1, score=1.0), self._state(uid=2, score=1.0)]
 

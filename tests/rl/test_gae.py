@@ -23,8 +23,8 @@ def naive_action_gae(
 ) -> torch.Tensor:
     """Straightforward per-token reference implementation.
 
-    Deliberately written as the textbook backward recursion so the vectorized
-    implementation can be differentially tested against it.
+    Deliberately written as the textbook backward recursion so the vectorized implementation can be differentially
+    tested against it.
     """
     flat_values = values.reshape(-1).float()
     flat_rewards = token_rewards.reshape(-1).float()
@@ -51,7 +51,8 @@ def _packed_batch(
     prompt_length: int = 3,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build (values, action_mask, cu_seq_lens, reward_scores) for a packed batch."""
+    """Build (values, action_mask, cu_seq_lens, reward_scores) for a packed
+    batch."""
     generator = torch.Generator().manual_seed(seed)
     values_parts: list[torch.Tensor] = []
     mask_parts: list[torch.Tensor] = []
@@ -215,10 +216,9 @@ class TestActionGAE:
         assert advantages.shape == (1,)
 
     def test_long_sequence_stays_finite(self) -> None:
-        """lambda**t underflows for long responses; the scan must not.
+        """Lambda**t underflows for long responses; the scan must not.
 
-        A closed-form (gamma*lambda)**t weighting would underflow to zero here,
-        silently zeroing early advantages.
+        A closed-form (gamma*lambda)**t weighting would underflow to zero here, silently zeroing early advantages.
         """
         length = 8192
         values = torch.zeros(1, length)
@@ -281,7 +281,8 @@ class TestGAEEstimator:
         assert bool((returns[~mask] == 0).all())
 
     def test_lambda_one_returns_are_reward_to_go(self) -> None:
-        """With gamma=lambda=1 the return target is the undiscounted reward-to-go."""
+        """With gamma=lambda=1 the return target is the undiscounted reward-to-
+        go."""
         values = torch.tensor([[0.1, 0.2, 0.3]])
         action_mask = torch.ones(1, 3, dtype=torch.bool)
         token_rewards = torch.tensor([[0.0, 0.0, 1.0]])

@@ -26,7 +26,8 @@ class TestKLDivergencePerToken:
 
     @pytest.mark.parametrize("kl_type", KL_TYPES)
     def test_matches_weighted_sum_of_kl_penalty(self, kl_type: str, logprob_pair) -> None:
-        """``kl_penalty`` must stay exactly the weighted sum of the per-token KL.
+        """``kl_penalty`` must stay exactly the weighted sum of the per-token
+        KL.
 
         This pins the refactor: the loss-side KL path is unchanged while the
         reward-side path consumes the same unreduced estimate.

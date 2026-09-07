@@ -7,7 +7,8 @@ from xtuner.v1.rl.trainer.controller import TOKEN_TENSOR_KEYS, TrainingControlle
 
 
 def _sample(seq_len: int, reward_at_last: float | None = None) -> dict:
-    """One trajectory as `_packing` expects it, optionally with token rewards."""
+    """One trajectory as `_packing` expects it, optionally with token
+    rewards."""
     input_ids = torch.arange(1, seq_len + 1, dtype=torch.long).unsqueeze(0)
     sample = {
         "seq_ctx": SequenceContext.from_input_ids((input_ids,), device="cpu"),

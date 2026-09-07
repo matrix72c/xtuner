@@ -455,8 +455,7 @@ class TrainingWorker(SingleAcceleratorWorker):
     def _init_ppo(self, worker_cfg: WorkerConfig) -> None:
         """Build the critic and validate the PPO configuration.
 
-        Both models are parked on CPU afterwards; the phase machine faults in
-        whichever one the current step needs.
+        Both models are parked on CPU afterwards; the phase machine faults in whichever one the current step needs.
         """
         critic_cfg = worker_cfg.critic_cfg
         assert critic_cfg is not None
@@ -663,7 +662,8 @@ class TrainingWorker(SingleAcceleratorWorker):
         self._set_ppo_phase(PPOPhase.ACTOR_TRAIN)
 
     def _step_critic_optimizer_and_scheduler(self, grad_norm: torch.Tensor) -> bool:
-        """Step the critic optimizer, advancing its schedule only if applied."""
+        """Step the critic optimizer, advancing its schedule only if
+        applied."""
         assert self._critic_engine is not None and self._critic_scheduler is not None
         applied = self._critic_engine.optimizer_step_will_apply(grad_norm)
         self._critic_engine.step_optimizer(grad_norm)
@@ -1506,7 +1506,8 @@ class TrainingWorker(SingleAcceleratorWorker):
         action_mask_list: list[torch.Tensor],
         cu_seq_lens_list: list[torch.Tensor],
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Compute advantages and returns, optionally normalizing advantages."""
+        """Compute advantages and returns, optionally normalizing
+        advantages."""
         estimator = self._advantage_estimator
         assert estimator is not None
 
@@ -1686,7 +1687,8 @@ class TrainingWorker(SingleAcceleratorWorker):
         rollout_idx: int,
         worker_log_item: WorkerLogItem,
     ) -> list[WorkerTrainLogItem]:
-        """Build actor loss contexts from GAE advantages and run the updates."""
+        """Build actor loss contexts from GAE advantages and run the
+        updates."""
         loss_cfg: BaseRLLossConfig = self.config.loss_cfg
 
         # Split now: the loss context owns the sharded view, while GAE needed

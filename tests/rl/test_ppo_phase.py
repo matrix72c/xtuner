@@ -1,8 +1,7 @@
 """Tests for the PPO actor/critic phase machine in the training worker.
 
-Actor and critic are full models that cannot both hold accelerator memory in a
-colocated run, so the worker swaps one for the other. These tests pin the
-transitions using a fake engine, with no real model, Ray or accelerator.
+Actor and critic are full models that cannot both hold accelerator memory in a colocated run, so the worker swaps one
+for the other. These tests pin the transitions using a fake engine, with no real model, Ray or accelerator.
 """
 
 import unittest
@@ -136,9 +135,8 @@ class TestPhaseTransitions(unittest.TestCase):
     def test_onload_actor_allowed_from_actor_ready(self):
         """The KL reward phase re-enters the actor after a warmup step.
 
-        A warmup step leaves the actor resident and the phase at ACTOR_READY;
-        the next rollout's KL phase needs a behavior forward and must not be
-        rejected, nor should it redundantly transfer the model again.
+        A warmup step leaves the actor resident and the phase at ACTOR_READY; the next rollout's KL phase needs a
+        behavior forward and must not be rejected, nor should it redundantly transfer the model again.
         """
         worker, log = _worker(with_critic=True)
         worker._ppo_phase = PPOPhase.ACTOR_READY
@@ -152,7 +150,8 @@ class TestPhaseTransitions(unittest.TestCase):
 
 
 class TestExternalLifecycleGuards(unittest.TestCase):
-    """The trainer drives offload/onload; it must not fault in the wrong model."""
+    """The trainer drives offload/onload; it must not fault in the wrong
+    model."""
 
     def test_external_onload_model_rejected_during_critic_phase(self):
         worker, _ = _worker(with_critic=True)

@@ -13,7 +13,8 @@ def _optimizer(lr: float = 1e-5) -> torch.optim.Optimizer:
 
 
 def _lr_trace(lr_cfg: LRConfig, total_steps: int, num_steps: int | None = None) -> list[float]:
-    """Learning rate observed before each of ``num_steps`` optimizer updates."""
+    """Learning rate observed before each of ``num_steps`` optimizer
+    updates."""
     optimizer = _optimizer()
     scheduler = lr_cfg.build(optimizer, total_steps)
     trace = []

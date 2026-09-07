@@ -487,8 +487,8 @@ class BaseRLTrainerConfig(BaseModel):
     def _validate_ppo(self) -> None:
         """Keep the critic and the advantage estimator consistent.
 
-        A token-level estimator such as GAE needs a value function, and a critic
-        is useless without one, so the two must be enabled together.
+        A token-level estimator such as GAE needs a value function, and a critic is useless without one, so the two
+        must be enabled together.
         """
         wants_critic = self.train_worker_cfg.critic_cfg is not None
         wants_token_level = isinstance(self.advantage_estimator_config, BaseTokenLevelAdvantageConfig)

@@ -297,8 +297,8 @@ class ValueLossContext(LMHeadLossContext):
     def _metrics(self, values: torch.Tensor, loss_kwargs: ValueLossKwargs) -> dict[str, Any]:
         """Collect per-rank sums for critic health metrics.
 
-        Sums rather than means are emitted so the caller can reduce them across
-        ranks and divide by the global count exactly once.
+        Sums rather than means are emitted so the caller can reduce them across ranks and divide by the global count
+        exactly once.
         """
         with torch.no_grad():
             mask = loss_kwargs.value_mask

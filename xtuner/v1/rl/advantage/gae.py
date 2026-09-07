@@ -228,7 +228,8 @@ def _validate_bounds(cu_seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor
 
 
 def _action_index(flat_mask: torch.Tensor, bounds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the flat indices of action tokens and the trajectory each belongs to."""
+    """Return the flat indices of action tokens and the trajectory each belongs
+    to."""
     action_idx = torch.nonzero(flat_mask, as_tuple=False).flatten()
     segment = torch.searchsorted(bounds.to(action_idx.device), action_idx, right=True) - 1
     return action_idx, segment

@@ -17,7 +17,8 @@ def _worker(loss_type: str = "clipped") -> TrainingWorker:
 
 
 def test_empty_rank_still_joins_critic_metric_collective() -> None:
-    """A rank-local empty metric dict must not skip the world-size collective."""
+    """A rank-local empty metric dict must not skip the world-size
+    collective."""
     global_totals = torch.tensor([2.0, 1.0, 0.5, 2.0, 2.5, 0.5, 1.0], dtype=torch.float64)
 
     def fake_all_reduce(totals: torch.Tensor, *, op: object) -> None:

@@ -182,7 +182,8 @@ class TestKLRewardConfig(unittest.TestCase):
 
 
 class TestCriticWarmup(unittest.TestCase):
-    """Warmup trains only the critic, so early noisy values never move the policy."""
+    """Warmup trains only the critic, so early noisy values never move the
+    policy."""
 
     @staticmethod
     def _worker(warmup_steps: int, rollout_step: int) -> TrainingWorker:
