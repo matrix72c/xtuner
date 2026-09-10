@@ -629,10 +629,12 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
         self.train_update_sync_group: dist.ProcessGroup | None = None
         self.hook_compare_test_sent_and_received_weight_hash: Callable[..., None] = (
             self._weight_sync_checksum_hook if os.environ.get("XTUNER_WEIGHT_SYNC_CHECKSUM", "0") == "1" else (lambda result, **kwargs: None)
-        )
-        # Per-engine checksums of the exact flattened bytes sent in this update.
-        # Populated by send() before the hook fires; keyed by engine url.
-        self._sent_checksums: dict[str, tuple[int, int, str]] = {}
+        )        # Per-engine checksums of the exact flattened bytes sent in this update.
+        # Populated by send() before the hook fires; keyed by engine url. The dict is
+        # keyed lazily per engine on first batch, so emptiness is NOT the enable flag.
+        self._checksum_enabled = os.environ.get("XTUNER_WEIGHT_SYNC_CHECKSUM", "0") == "1"
+        self._sent_checksums: dict[str, dict[int, tuple[int, int, str]]] = {}
+        self._checksum_batch_idx: int = 0
 
         self.engine_urls: list[str] = []
         self.external_group_world_size: int | None = None
@@ -671,11 +673,12 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
         expected = self._sent_checksums.get(url)
         received = message.get("received_checksums") if isinstance(message, dict) else None
         if expected is None or received is None:
-            self.logger.info(
-                "[weight-sync-checksum] engine=%s: %s",
-                engine,
-                "no sent checksum recorded for this engine" if expected is None else "engine returned no checksums",
+            reason = (
+                f"no sent checksum recorded for engine url {url!r}"
+                if expected is None
+                else "engine returned no checksums"
             )
+            self.logger.info(f"[weight-sync-checksum] engine={engine}: {reason}")
             return
         ok = True
         for batch_idx, (n_exp, nf_exp, d_exp) in expected.items():
@@ -683,18 +686,18 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
             if got is None:
                 ok = False
                 self.logger.warning(
-                    "[weight-sync-checksum] engine=%s batch=%d MISSING (expected numel=%d sha1=%s)",
-                    engine, batch_idx, n_exp, d_exp,
+                    f"[weight-sync-checksum] engine={engine} batch={batch_idx} MISSING "
+                    f"(expected numel={n_exp} sha1={d_exp})"
                 )
             elif got[2] != d_exp:
                 ok = False
                 self.logger.warning(
-                    "[weight-sync-checksum] engine=%s batch=%d MISMATCH numel %s->%s nonfinite %s->%s sha1 %s->%s",
-                    engine, batch_idx, n_exp, got[0], nf_exp, got[1], d_exp, got[2],
+                    f"[weight-sync-checksum] engine={engine} batch={batch_idx} MISMATCH "
+                    f"numel {n_exp}->{got[0]} nonfinite {nf_exp}->{got[1]} sha1 {d_exp}->{got[2]}"
                 )
         if ok:
             self.logger.info(
-                "[weight-sync-checksum] engine=%s: all %d batch checksums MATCH", engine, len(expected)
+                f"[weight-sync-checksum] engine={engine}: all {len(expected)} batch checksums MATCH"
             )
 
     def _build_adapter(self) -> NCCLBackendAdapter:
@@ -830,26 +833,19 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
             if flattened_tensor is not None:
                 # LMDeploy send empty payload finally.
                 # Send the flattened weight tensor through the external NCCL group.
-                if self._sent_checksums:
-                    # maintain a per-batch index so engines can report back in order
-                    if not hasattr(self, "_checksum_batch_idx"):
-                        self._checksum_batch_idx = 0
-                    self._sent_checksums = {
-                        url: {**prev, self._checksum_batch_idx: self._checksum_tensor(flattened_tensor)}
-                        for url, prev in (
-                            (u, self._sent_checksums.get(u, {})) for u in self.engine_urls
-                        )
-                    }
+                if self._checksum_enabled:
+                    idx = self._checksum_batch_idx
+                    fingerprint = self._checksum_tensor(flattened_tensor)
+                    for url in self.engine_urls:
+                        self._sent_checksums.setdefault(url, {})[idx] = fingerprint
                     self._checksum_batch_idx += 1
                     self.logger.info(
-                        "[weight-sync-checksum] broadcasting batch %d: numel=%d sha1=%s",
-                        self._checksum_batch_idx - 1,
-                        flattened_tensor.numel(),
-                        self._sent_checksums[self.engine_urls[0]][self._checksum_batch_idx - 1][2],
+                        "[weight-sync-checksum] broadcasting batch %d numel=%d sha1=%s",
+                        idx, fingerprint[0], fingerprint[2],
                     )
                 dist.broadcast(flattened_tensor, src=0, group=self.group)
                 DEVICE_MODULE.synchronize()
-                if self._sent_checksums:
+                if self._checksum_enabled:
                     after = self._checksum_tensor(flattened_tensor)
                     before = self._sent_checksums[self.engine_urls[0]][self._checksum_batch_idx - 1]
                     if after[2] != before[2]:
