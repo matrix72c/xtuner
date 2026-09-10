@@ -627,12 +627,75 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
         self.group_name: str | None = None
         self.executor: ThreadPoolExecutor | None = None
         self.train_update_sync_group: dist.ProcessGroup | None = None
-        self.hook_compare_test_sent_and_received_weight_hash: Callable[..., None] = lambda result, **kwargs: None
+        self.hook_compare_test_sent_and_received_weight_hash: Callable[..., None] = (
+            self._weight_sync_checksum_hook if os.environ.get("XTUNER_WEIGHT_SYNC_CHECKSUM", "0") == "1" else (lambda result, **kwargs: None)
+        )
+        # Per-engine checksums of the exact flattened bytes sent in this update.
+        # Populated by send() before the hook fires; keyed by engine url.
+        self._sent_checksums: dict[str, tuple[int, int, str]] = {}
 
         self.engine_urls: list[str] = []
         self.external_group_world_size: int | None = None
 
         self._adapter = self._build_adapter()
+
+    @staticmethod
+    def _checksum_tensor(tensor) -> tuple[int, int, str]:
+        """Cheap content fingerprint: element count, non-finite count, sha1 of raw bytes.
+
+        The non-finite count separates "garbage values arrived" (likely layout/type
+        confusion) from "valid-looking bytes are wrong" (offset/shift corruption).
+        """
+        import hashlib
+
+        n = tensor.numel()
+        non_finite = int(torch.sum(~torch.isfinite(tensor)).item()) if tensor.dtype.is_floating_point else 0
+        cpu = tensor.detach().to("cpu", torch.uint8, non_blocking=False).view(-1)
+        digest = hashlib.sha1(cpu.numpy()).hexdigest()
+        return n, non_finite, digest
+
+    def _weight_sync_checksum_hook(self, result, **kwargs) -> None:
+        """Compare sender-side flattened-buffer checksums against what each engine reports.
+
+        Enabled via XTUNER_WEIGHT_SYNC_CHECKSUM=1. The rollout engine must report
+        checksums of every flattened buffer it received, keyed by batch index, in the
+        same order the sender broadcast them. Any mismatch localises corruption to the
+        transport; full agreement shifts suspicion to the engine's own load path.
+        """
+        names = kwargs.get("names")
+        url = kwargs.get("url")
+        # The HTTP wrapper packs the engine reply as {'success': bool, 'message': ...};
+        # when checksums are enabled the engine returns the report dict as `message`.
+        message = result.get("message") if isinstance(result, dict) else None
+        engine = message.get("engine", url) if isinstance(message, dict) else url
+        expected = self._sent_checksums.get(url)
+        received = message.get("received_checksums") if isinstance(message, dict) else None
+        if expected is None or received is None:
+            self.logger.info(
+                "[weight-sync-checksum] engine=%s: %s",
+                engine,
+                "no sent checksum recorded for this engine" if expected is None else "engine returned no checksums",
+            )
+            return
+        ok = True
+        for batch_idx, (n_exp, nf_exp, d_exp) in expected.items():
+            got = received.get(str(batch_idx))
+            if got is None:
+                ok = False
+                self.logger.warning(
+                    "[weight-sync-checksum] engine=%s batch=%d MISSING (expected numel=%d sha1=%s)",
+                    engine, batch_idx, n_exp, d_exp,
+                )
+            elif got[2] != d_exp:
+                ok = False
+                self.logger.warning(
+                    "[weight-sync-checksum] engine=%s batch=%d MISMATCH numel %s->%s nonfinite %s->%s sha1 %s->%s",
+                    engine, batch_idx, n_exp, got[0], nf_exp, got[1], d_exp, got[2],
+                )
+        if ok:
+            self.logger.info(
+                "[weight-sync-checksum] engine=%s: all %d batch checksums MATCH", engine, len(expected)
+            )
 
     def _build_adapter(self) -> NCCLBackendAdapter:
         if self.backend == "sglang":
@@ -767,15 +830,42 @@ class NCCLWeightTransport(WeightTransport[NCCLBackendAdapter]):
             if flattened_tensor is not None:
                 # LMDeploy send empty payload finally.
                 # Send the flattened weight tensor through the external NCCL group.
+                if self._sent_checksums:
+                    # maintain a per-batch index so engines can report back in order
+                    if not hasattr(self, "_checksum_batch_idx"):
+                        self._checksum_batch_idx = 0
+                    self._sent_checksums = {
+                        url: {**prev, self._checksum_batch_idx: self._checksum_tensor(flattened_tensor)}
+                        for url, prev in (
+                            (u, self._sent_checksums.get(u, {})) for u in self.engine_urls
+                        )
+                    }
+                    self._checksum_batch_idx += 1
+                    self.logger.info(
+                        "[weight-sync-checksum] broadcasting batch %d: numel=%d sha1=%s",
+                        self._checksum_batch_idx - 1,
+                        flattened_tensor.numel(),
+                        self._sent_checksums[self.engine_urls[0]][self._checksum_batch_idx - 1][2],
+                    )
                 dist.broadcast(flattened_tensor, src=0, group=self.group)
                 DEVICE_MODULE.synchronize()
+                if self._sent_checksums:
+                    after = self._checksum_tensor(flattened_tensor)
+                    before = self._sent_checksums[self.engine_urls[0]][self._checksum_batch_idx - 1]
+                    if after[2] != before[2]:
+                        self.logger.warning(
+                            "[weight-sync-checksum] sender buffer CHANGED across broadcast "
+                            "(sha1 %s -> %s): rank0 buffer aliasing/corruption",
+                            before[2], after[2],
+                        )
             # Wait for rollout engines to finish loading weights and validate
             # backend-specific update results.
-            for update_future in update_futures:
+            for url, update_future in zip(self.engine_urls, update_futures):
                 result = update_future.result()
                 self.hook_compare_test_sent_and_received_weight_hash(
                     result,
                     names=weight_names,
+                    url=url,
                 )
                 assert result.get("success", True), (
                     f"update_weights_from_distributed failed: {result.get('message', result)}"
