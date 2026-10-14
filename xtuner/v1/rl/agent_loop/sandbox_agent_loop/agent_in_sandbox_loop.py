@@ -16,6 +16,7 @@ from pydantic import Field
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
+from xtuner.v1.rl.trace.rollout_api import trace_rollout_endpoint
 
 from ...rollout.trace_store import get_store
 from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
@@ -314,6 +315,7 @@ class AgentInSandboxLoop(AgentLoop):
             await self.partial.discard(samples)
         return samples
 
+    @trace_rollout_endpoint("agent_in_sandbox_loop.generate_sample", target_arg="state")
     async def generate_sample(self, state: RolloutState, **kwargs) -> list[RolloutState]:  # type: ignore[override]
         if self.partial.closing:
             raise RuntimeError("Agent episode loop is closed")
