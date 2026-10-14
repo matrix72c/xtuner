@@ -58,7 +58,35 @@ This is an API migration, with no second Runner implementation:
 5. Treat `Status.FAILED` / missing reward as infrastructure or execution failure in
    evaluation. Only a completed verifier result supplies a task score.
 
-Environment extraction alone does not implement live partial rollout. An owner
-that retains an episode across pauses must keep its context open until that
-same episode completes or is discarded. Do not create resources per trace segment,
+The loop retains the environment context until the same episode completes or
+is discarded. Do not create resources per trace segment,
 reuse one environment across episodes, or reuse provider connections after close.
+
+## Live episodes across model updates
+
+`AgentInSandboxLoopConfig(partial_rollout=True)` retains the environment context
+and Runner task in the local loop owner. The harness receives an ephemeral
+`item.execution` context: call `checkpoint()` before starting a new phase and
+`attach(controller, read_segments)` to install request-boundary control. The
+controller accepts `pause`, `resume`, and `status`, and returns active/completed
+request counts. `pause` must stop new requests while allowing existing responses
+to drain. `read_segments(completed)` returns the recorded transcript branches.
+These callbacks carry no sampling or policy-age decisions.
+
+Both existing managers call `prepare_pause()` before global inference abort and
+`resume()` after inference continuation. The loop exports exact trace-store token
+IDs, masks, and log probabilities; an append-only response journal lets the
+existing producer stamp model versions. On final export, each branch inherits
+its recorded prefix versions. An expired multi-branch episode is rerun once.
+Completed siblings from other episodes are retained.
+
+Limits are explicit: this is live, in-process continuation, not durable recovery.
+Do not configure the generic Ray worker router for partial episodes (it has no
+owner affinity). A missing owner or changed trace fails the sample. Request drain
+has a configured deadline; expiry cancels and reclaims the episode. Ordinary
+queued work is cancelled on pause. `close()` drains owned episodes before closing
+the provider; call it while Ray and the original asyncio loop are still alive.
+
+Stage records can be written under `artifact_root/<session_id>/`; optional partial
+lifecycle events contain session, environment, pause count, and version summaries.
+Do not put credentials in stage command text; use structured environment transport.
