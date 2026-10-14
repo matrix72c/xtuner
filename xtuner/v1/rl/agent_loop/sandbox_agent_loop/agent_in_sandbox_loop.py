@@ -4,6 +4,7 @@ import asyncio
 import copy
 import importlib
 import json
+import os
 import traceback
 import uuid
 from contextlib import nullcontext
@@ -23,7 +24,13 @@ from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
 from .environment import EnvironmentProvider
 from .episode import EpisodeContext, PartialRuns, aborted
 from .schemas import AgentRolloutItem, RolloutStatus
-from .training_trace import TracePending, TraceTokens, apply_training_trace, response_prefix_versions, training_segments
+from .training_trace import (
+    TracePending,
+    TraceTokens,
+    apply_training_trace,
+    response_prefix_versions,
+    training_segments,
+)
 
 
 _MISSING = object()
@@ -443,6 +450,7 @@ class AgentInSandboxLoop(AgentLoop):
             if name.startswith("agent_") and name != "agent_partial_handle":
                 state.extra_fields.pop(name)
         item = None
+        trace_diagnostics = None
         try:
             item = state.extra_fields["rollout_item"].model_copy(deep=True)
             # A new execution attempt needs a fresh inference session even when
@@ -484,6 +492,8 @@ class AgentInSandboxLoop(AgentLoop):
                 return [state]
             return [aborted(state)]
         except Exception as exc:
+            if isinstance(exc, TracePending):
+                trace_diagnostics = exc.diagnostics
             state.status, state.reward, state.finish_reason = Status.FAILED, None, "error"
             state.error_msg = f"{type(exc).__name__}: {exc}"
             self.logger.error(f"[AgentInSandboxLoop] failed: {exc}\n{traceback.format_exc()}")
@@ -501,6 +511,28 @@ class AgentInSandboxLoop(AgentLoop):
                             {name: record.model_dump(mode="json") for name, record in item.judgers.items()}, indent=2
                         )
                     )
+                    if state.status == Status.FAILED:
+                        evidence = {
+                            "task_id": item.id,
+                            "group_id": str(item.group_id) if item.group_id is not None else None,
+                            "session_id": str(state.session_id),
+                            "environment_id": state.extra_fields.get("agent_environment"),
+                            "error": state.error_msg,
+                            "finish_reason": state.finish_reason,
+                            "trace": trace_diagnostics,
+                            "artifacts": {
+                                key: _to_json_safe(item.artifacts[key])
+                                for key in ("messages", "response_message")
+                                if key in item.artifacts
+                            },
+                        }
+                        path = directory / "failure.json"
+                        # Includes task/model text. A fresh session owns this
+                        # path; do not follow or overwrite an existing file.
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w") as stream:
+                            json.dump(evidence, stream, indent=2)
+                        state.extra_fields["agent_failure_evidence"] = str(path)
                 except OSError:
                     self.logger.exception("Unable to persist episode stage evidence")
 
@@ -621,8 +653,18 @@ class AgentInSandboxLoop(AgentLoop):
             for prompt in prompts:
                 covered.update(await recorded(prompt))
             for key in missing:
-                if any(covered.get(token_key) != value for token_key, value in (await recorded(key)).items()):
-                    raise TracePending("waiting for the agent to record all completed inference branches")
+                uncovered = sum(covered.get(token_key) != value for token_key, value in (await recorded(key)).items())
+                if uncovered:
+                    raise TracePending(
+                        "waiting for the agent to record all completed inference branches",
+                        diagnostics={
+                            "stored_branches": len(keys),
+                            "matched_branches": len(prompts),
+                            "covered_response_tokens": len(covered),
+                            "uncovered_response_tokens": uncovered,
+                            "missing_trace_key": key,
+                        },
+                    )
         return branches
 
     async def partial_trace(self, state, segments):

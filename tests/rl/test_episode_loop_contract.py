@@ -205,3 +205,97 @@ async def test_failure_never_becomes_reward_and_resources_are_released(monkeypat
     assert result.status == (Status.ABORTED if failure == "cancel" else Status.FAILED)
     assert result.reward is None and result.input_ids is None and result.response_ids is None
     assert events == (["create", "close"] if failure == "create" else ["create", "release", "close"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "unwritable", "complete"])
+async def test_final_trace_failure_preserves_private_evidence_without_reward(monkeypatch, tmp_path, case):
+    import json
+    import stat
+
+    from xtuner.v1.rl.agent_loop.sandbox_agent_loop import RolloutStatus
+
+    tokenizer = SimpleNamespace(
+        eos_token=None,
+        apply_chat_template=lambda messages, **kwargs: messages[-1]["content"],
+        decode=lambda ids: "A",
+    )
+    monkeypatch.setattr(agent_loop, "load_tokenizer", lambda *a, **k: tokenizer)
+    monkeypatch.setattr(agent_loop, "load_processor", lambda *a, **k: None)
+    released = []
+
+    class Provider:
+        @asynccontextmanager
+        async def open(self, item):
+            try:
+                yield SimpleNamespace(check=AsyncMock())
+            finally:
+                released.append(item.uid)
+
+        async def close(self):
+            pass
+
+    async def run(item, environment):
+        item.status, item.reward = RolloutStatus.COMPLETED, 1.0
+        item.infer.sandbox_env_id = "owned-environment"
+        item.artifacts.update(
+            messages=[{"messages": [{"role": "assistant", "content": "A"}], "tools": []}],
+            response_message={"content": "A"},
+            unrelated_credentials={"secret": "must-not-be-copied"},
+        )
+        return item
+
+    async def export(session, key):
+        token = 10 if key == "A" else 11
+        return {"input_ids": [1, token], "labels": [-100, token], "logprobs": [0.0, -0.2]}
+
+    store = SimpleNamespace(
+        keys=SimpleNamespace(remote=AsyncMock(return_value=["A"] if case == "complete" else ["A", "B"])),
+        export_training_trace=SimpleNamespace(remote=export),
+    )
+    monkeypatch.setattr(impl, "get_store", lambda: store)
+    monkeypatch.setattr(impl, "_resolve_runner", lambda *a: SimpleNamespace(run=run))
+    if case == "unwritable":
+        original_open = impl.os.open
+
+        def deny_failure_file(path, *args, **kwargs):
+            if str(path).endswith("failure.json"):
+                raise PermissionError("diagnostic write denied")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(impl.os, "open", deny_failure_file)
+    loop = AgentInSandboxLoopConfig(
+        hf_checkpoint="unused", environment_provider={}, artifact_root=str(tmp_path)
+    ).build_local()
+    loop._environment_provider = Provider()
+    state = RolloutState(
+        message=[],
+        extra_fields={"rollout_item": AgentRolloutItem(id="neutral", data_source="unit", instruction="i")},
+    )
+    [result] = await loop.generate_sample(state)
+    await loop.close()
+    assert released == [result.session_id]
+    path = tmp_path / str(result.session_id) / "failure.json"
+    if case == "complete":
+        assert result.status == Status.COMPLETED and result.reward == {"score": 1.0}
+        assert not path.exists()
+        return
+    assert result.status == Status.FAILED and result.reward is None
+    assert "TracePending" in result.error_msg
+    if case == "unwritable":
+        assert not path.exists()
+        return
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    evidence = json.loads(path.read_text())
+    assert evidence["session_id"] == str(result.session_id)
+    assert evidence["environment_id"] == "owned-environment"
+    assert evidence["trace"] == {
+        "stored_branches": 2,
+        "matched_branches": 1,
+        "covered_response_tokens": 1,
+        "uncovered_response_tokens": 1,
+        "missing_trace_key": "B",
+    }
+    assert evidence["artifacts"]["messages"][0]["messages"][-1]["content"] == "A"
+    assert set(evidence["artifacts"]) == {"messages", "response_message"}
+    assert result.extra_fields["agent_failure_evidence"] == str(path)

@@ -70,6 +70,12 @@ def training_segments(tokenizer, segments, *, require_assistant=False, stored_ke
 class TracePending(Exception):
     """The agent has not yet recorded every response already in the store."""
 
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        # May contain task/model text. Persist only in private failure artifacts,
+        # never in the exception string (which is sent to shared logs).
+        self.diagnostics = diagnostics
+
 
 @dataclass(frozen=True)
 class TraceTokens:

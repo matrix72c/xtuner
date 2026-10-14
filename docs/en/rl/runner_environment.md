@@ -90,3 +90,12 @@ the provider; call it while Ray and the original asyncio loop are still alive.
 Stage records can be written under `artifact_root/<session_id>/`; optional partial
 lifecycle events contain session, environment, pause count, and version summaries.
 Do not put credentials in stage command text; use structured environment transport.
+
+Failed episodes also write `failure.json` with owner-only permissions (`0600`).
+It retains task/session/environment IDs, the error, and the `messages` and
+`response_message` artifacts when available. A final trace coverage failure adds
+the missing stored branch and token counts so it can be investigated after
+environment cleanup. This file contains task/model text; handle it with the same
+access and retention policy as training trajectories. It is not copied to shared
+logs. Diagnostic write failures are logged and do not replace the original
+episode failure or turn it into a reward.
