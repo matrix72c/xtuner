@@ -13,7 +13,7 @@ from typing import Any, Literal
 from lagent.utils import create_object
 from pydantic import Field
 
-from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
+from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status, write_train_meta
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.trace.rollout_api import trace_rollout_endpoint
@@ -23,7 +23,7 @@ from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
 from .environment import EnvironmentProvider
 from .episode import EpisodeContext, PartialRuns, aborted
 from .schemas import AgentRolloutItem, RolloutStatus
-from .training_trace import TracePending, TraceTokens, apply_training_trace, training_segments
+from .training_trace import TracePending, TraceTokens, apply_training_trace, response_prefix_versions, training_segments
 
 
 _MISSING = object()
@@ -310,10 +310,49 @@ class AgentInSandboxLoop(AgentLoop):
         samples = [sample for group in groups for sample in group]
         samples = maybe_filter_invalid_sample(samples, self.is_valid_sample_fn, self.logger)
         samples = await teacher.on_group_ready(samples) if teacher else samples
+        samples = self.canonicalize_train_fields(samples)
         if any(sample.status in (Status.FAILED, Status.FILTERED) for sample in samples):
             # Producer discards the whole group; no retained sibling can be resumed.
             await self.partial.discard(samples)
         return samples
+
+    def canonicalize_train_fields(self, group: list[RolloutState]) -> list[RolloutState]:
+        """Validate the canonical training fields of one sandbox agentic
+        rollout group.
+
+        Each segment state carries ``input_ids``/``labels``/``logprobs`` exported from
+        the trace store as one unshifted full sequence, so there is nothing left to
+        assemble. Canonicalization only re-checks the unified convention (``labels``
+        present and of equal length, ``logprobs`` either ``None`` or of equal length)
+        per segment state and marks a violating sample ``Status.FAILED`` instead of
+        raising into the producer. States without ``input_ids`` (eval-mode states) carry
+        no training fields and are skipped.
+
+        Args:
+            group (list[RolloutState]): One flattened group of segment rollout states
+                after generation, judging, and filtering.
+
+        Returns:
+            list[RolloutState]: The same group with validated training fields.
+        """
+        for state in group:
+            if state.status != Status.COMPLETED or state.input_ids is None:
+                continue
+            try:
+                labels = state.labels
+                if labels is None or len(labels) != len(state.input_ids):
+                    expected = 0 if labels is None else len(labels)
+                    raise ValueError(f"labels length mismatch: {expected} vs {len(state.input_ids)}")
+                if state.logprobs is not None and len(state.logprobs) != len(state.input_ids):
+                    raise ValueError(f"logprobs length mismatch: {len(state.logprobs)} vs {len(state.input_ids)}")
+            except Exception as exc:
+                self.logger.error(f"Canonicalize train fields failed for rollout_id={state.rollout_id}: {exc}")
+                state.status = Status.FAILED
+                state.reward = None
+                state.error_msg = f"canonicalize_train_fields failed: {exc}"
+        for state in group:
+            write_train_meta(state)
+        return group
 
     @trace_rollout_endpoint("agent_in_sandbox_loop.generate_sample", target_arg="state")
     async def generate_sample(self, state: RolloutState, **kwargs) -> list[RolloutState]:  # type: ignore[override]
@@ -391,7 +430,6 @@ class AgentInSandboxLoop(AgentLoop):
             "response_model_steps",
             "logprobs",
             "routed_experts",
-            "response_mask",
             "teacher_targets",
             "response",
             "tool_calls",
@@ -435,7 +473,7 @@ class AgentInSandboxLoop(AgentLoop):
                             for sample in samples
                         ]
                         for sample, versions in zip(samples, partial.segment_versions(traces), strict=True):
-                            sample.response_model_steps = versions
+                            sample.response_model_steps = response_prefix_versions(sample, versions)
                             sample.extra_fields["agent_partial_pauses"] = partial.pauses
                 await environment.check()
             return samples
@@ -535,7 +573,6 @@ class AgentInSandboxLoop(AgentLoop):
         rollout_state.logprobs = None
         rollout_state.routed_experts = None
         rollout_state.routed_experts_owner = None
-        rollout_state.response_mask = None
         rollout_state.response_model_steps = None
         rollout_state.extra_fields["origin_data_source"] = item.data_source
         rollout_state.extra_fields["agent_status"] = item.status.value

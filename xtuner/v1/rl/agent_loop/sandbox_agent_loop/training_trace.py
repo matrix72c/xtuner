@@ -112,4 +112,29 @@ def apply_training_trace(state: Any, trace: dict[str, Any]) -> None:
     state.routed_experts = trace.get("routed_experts")
     if hasattr(state, "routed_experts_owner"):
         state.routed_experts_owner = "trace_store" if state.routed_experts is not None else None
-    state.response_ids = [token for token, label in zip(tokens[1:], labels[1:], strict=True) if label != -100]
+    state.response_ids = list(tokens[len(state.prompt_ids or []):])
+
+
+def response_prefix_versions(state, model_versions: list[int]) -> list[int]:
+    """Project old model-token versions onto the contiguous response suffix.
+
+    The live journal contains only generated tokens. Upstream replay stamps a
+    contiguous suffix including tool/context tokens. Give masked positions the
+    adjacent old generation's version; stop before the first new generation so
+    replay can stamp the remaining suffix with the current model version.
+    """
+    if not model_versions:
+        return []
+    prefix, consumed = [], 0
+    for index in range(len(state.prompt_ids or []), len(state.input_ids)):
+        if index > 0 and state.labels[index] != -100:
+            if consumed == len(model_versions):
+                break
+            version = model_versions[consumed]
+            consumed += 1
+        else:
+            version = model_versions[max(consumed - 1, 0)]
+        prefix.append(version)
+    if consumed != len(model_versions):
+        raise ValueError("old model versions exceed the generated trace tokens")
+    return prefix

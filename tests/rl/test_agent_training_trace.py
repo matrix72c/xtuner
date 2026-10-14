@@ -11,6 +11,28 @@ from xtuner.v1.rl.agent_loop.sandbox_agent_loop.training_trace import render_tra
 from xtuner.v1.rl.rollout.session_server import FMT_OPENAI, SessionServer
 
 
+def test_partial_versions_cover_tool_tokens_without_training_on_them():
+    from xtuner.v1.data_proto.rl_data import RolloutState, Status, write_train_meta
+    from xtuner.v1.rl.agent_loop.sandbox_agent_loop.training_trace import (
+        apply_training_trace, response_prefix_versions,
+    )
+
+    state = RolloutState(message=[], prompt_ids=[1, 2], status=Status.COMPLETED)
+    trace = {
+        "input_ids": [1, 2, 10, 30, 31, 11, 32, 12],
+        "labels": [-100, -100, 10, -100, -100, 11, -100, 12],
+        "logprobs": [0., 0., -.2, 0., 0., -.3, 0., -.4],
+    }
+    apply_training_trace(state, trace)
+    assert state.response_ids == [10, 30, 31, 11, 32, 12]
+    previous = response_prefix_versions(state, [7, 8])
+    assert previous == [7, 7, 7, 8, 8]
+    state.response_model_steps = previous + [9]
+    write_train_meta(state)
+    assert [token for token in state.labels if token != -100] == [10, 11, 12]
+    assert len(state.response_model_steps) == len(state.response_ids)
+
+
 class Tokenizer:
     eos_token = "<eos>"
 

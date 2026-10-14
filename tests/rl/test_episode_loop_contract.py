@@ -133,8 +133,8 @@ async def test_one_environment_and_session_survive_pause_and_policy_update(monke
         await loop.resume()
         final = (await asyncio.wait_for(loop.generate_group([parked], enable_partial_rollout=True), 5))[0]
         assert final.status == Status.COMPLETED and final.reward == {"score": 1.0}
-        assert final.response_ids == [10, 11]
-        assert final.response_model_steps == [7]
+        assert final.response_ids == final.input_ids[len(final.prompt_ids or []):]
+        assert final.response_model_steps == [7, 7]
         assert len(seen_sessions) == 1
         assert final.session_id == parked.session_id == seen_sessions[0]
         assert owned == ["open", "release"]
