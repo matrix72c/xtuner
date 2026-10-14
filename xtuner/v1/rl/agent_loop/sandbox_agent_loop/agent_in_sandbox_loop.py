@@ -528,6 +528,7 @@ class AgentInSandboxLoop(AgentLoop):
         rollout_state.response_ids = None
         rollout_state.logprobs = None
         rollout_state.routed_experts = None
+        rollout_state.routed_experts_owner = None
         rollout_state.response_mask = None
         rollout_state.response_model_steps = None
         rollout_state.extra_fields["origin_data_source"] = item.data_source
