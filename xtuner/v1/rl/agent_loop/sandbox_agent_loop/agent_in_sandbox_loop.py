@@ -18,6 +18,7 @@ from xtuner.v1.rl.utils import create_task
 from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
 from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
+from .environment import EnvironmentProvider
 from .schemas import AgentRolloutItem, RolloutStatus
 
 
@@ -192,6 +193,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
     replay buffer/trainer.
     """
 
+    environment_provider: dict[str, Any] | str
     max_concurrent_samples: int | None = None
     mode: Literal["train", "eval"] = "train"
     requires_rollout_proxy: bool = True
@@ -207,6 +209,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
             logger=logger,
             max_concurrent_samples=self.max_concurrent_samples,
             mode=self.mode,
+            environment_provider=self.environment_provider,
         )
 
 
@@ -220,6 +223,8 @@ class AgentInSandboxLoop(AgentLoop):
         logger=None,
         max_concurrent_samples: int | None = None,
         mode: Literal["train", "eval"] = "train",
+        *,
+        environment_provider: dict[str, Any] | str,
     ):
         if hf_checkpoint is None:
             raise ValueError("hf_checkpoint must be provided for AgentInSandboxLoop.")
@@ -227,6 +232,8 @@ class AgentInSandboxLoop(AgentLoop):
         self.max_concurrent_samples = max_concurrent_samples
         self._sample_semaphore = asyncio.Semaphore(max_concurrent_samples) if max_concurrent_samples else None
         self.mode = mode
+        self._environment_config = environment_provider
+        self._environment_provider: EnvironmentProvider | None = None
 
     async def generate_group(self, rollout_state: list[RolloutState], **kwargs) -> list[RolloutState]:
         async def generate_one(state: RolloutState) -> list[RolloutState]:
@@ -265,10 +272,10 @@ class AgentInSandboxLoop(AgentLoop):
             result = await self._run_item(rollout_item)
             return await self._build_rollout_states(rollout_state, result)
         except Exception as exc:
-            rollout_state.status = Status.COMPLETED if self.mode == "eval" else Status.FAILED
+            rollout_state.status = Status.FAILED
+            rollout_state.reward = None
             rollout_state.finish_reason = "error"
             if self.mode == "eval":
-                rollout_state.reward = {"score": 0.0}
                 rollout_state.response = ""
                 rollout_state.extra_fields["agent_status"] = "exception"
             rollout_state.error_msg = f"{type(exc).__name__}: {exc}"
@@ -279,7 +286,21 @@ class AgentInSandboxLoop(AgentLoop):
         runner = _resolve_runner(item.pipeline, str(item.uid))
         if runner is None:
             raise ValueError("AgentRolloutItem.pipeline is required.")
-        return await runner.run(item)
+        if self._environment_provider is None:
+            config = self._environment_config
+            if isinstance(config, str):
+                config = _import_from_path(config)
+            self._environment_provider = create_object(copy.deepcopy(config))
+        async with self._environment_provider.open(item) as environment:
+            result = await runner.run(item, environment)
+            await environment.check()
+        return result
+
+    async def close(self) -> None:
+        """Close worker connections after the manager drains episode tasks."""
+        if self._environment_provider is not None:
+            await self._environment_provider.close()
+            self._environment_provider = None
 
     async def _build_rollout_states(self, rollout_state: RolloutState, item: AgentRolloutItem) -> list[RolloutState]:
         if self.mode == "eval":
@@ -362,9 +383,9 @@ class AgentInSandboxLoop(AgentLoop):
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
         is_success = item.status == RolloutStatus.COMPLETED
         response_message = _response_message(item.artifacts, required=is_success)
-        rollout_state.status = Status.COMPLETED
+        rollout_state.status = Status.COMPLETED if is_success else Status.FAILED
         rollout_state.finish_reason = str(response_message.get("finish_reason") or ("stop" if is_success else "error"))
-        rollout_state.reward = {"score": item.reward if is_success and item.reward is not None else 0.0}
+        rollout_state.reward = {"score": item.reward} if is_success and item.reward is not None else None
         rollout_state.input_ids = None
         rollout_state.labels = None
         rollout_state.response_ids = None
