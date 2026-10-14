@@ -544,6 +544,7 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
         trainer.rollout_controller = SimpleNamespace(
             pause_generation=SimpleNamespace(remote=MagicMock(return_value="pause_generation")),
             continue_generation=SimpleNamespace(remote=MagicMock(return_value="continue_generation")),
+            onload_kvcache=SimpleNamespace(remote=MagicMock(side_effect=lambda: events.append("ready"))),
         )
         events: list[str] = []
 
@@ -552,6 +553,7 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
             return 3
 
         async def manager_continue_produce(model_step: int):
+            self.assertIn("ready", events, "Producer must not resume while inference is sleeping")
             events.append(f"continue_produce:{model_step}")
 
         trainer.agent_loop_manager = SimpleNamespace(
@@ -570,7 +572,7 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
         trainer.agent_loop_manager.resume.assert_awaited_once_with(Path(self.temp_dir.name))
         trainer.agent_loop_manager.continue_produce.assert_awaited_once_with(model_step=3)
         self.assertTrue(events[0].startswith("manager_resume:"))
-        self.assertEqual(events[1:], ["update_weights", "continue_produce:3"])
+        self.assertEqual(events[1:], ["update_weights", "ready", "continue_produce:3"])
 
     def test_validate_sync_schedule_accepts_multiples(self):
         # 验证保存、HF 导出、评测周期都可以对齐 sync_weights_interval。
