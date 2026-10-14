@@ -4,22 +4,33 @@ import asyncio
 import copy
 import importlib
 import json
+import os
 import traceback
 import uuid
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from lagent.utils import create_object
+from pydantic import Field
 
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status, write_train_meta
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.trace.rollout_api import trace_rollout_endpoint
-from xtuner.v1.rl.utils import create_task
 
-from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
 from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
+from .environment import EnvironmentProvider
+from .episode import EpisodeContext, PartialRuns, aborted
 from .schemas import AgentRolloutItem, RolloutStatus
+from .training_trace import (
+    TracePending,
+    TraceTokens,
+    apply_training_trace,
+    response_prefix_versions,
+    training_segments,
+)
 
 
 _MISSING = object()
@@ -193,9 +204,20 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
     replay buffer/trainer.
     """
 
-    max_concurrent_samples: int | None = None
+    environment_provider: dict[str, Any] | str
+    max_concurrent_samples: int = Field(default=32, gt=0)
+    partial_rollout: bool = False
+    partial_pause_timeout: float = Field(default=240, gt=0, lt=280)
+    artifact_root: str | None = None
     mode: Literal["train", "eval"] = "train"
     requires_rollout_proxy: bool = True
+
+    def build(self, *args, **kwargs):
+        if self.partial_rollout and self.cpu_resources is not None:
+            raise ValueError("live partial episodes require a local loop owner; worker migration is unsupported")
+        if self.partial_rollout and self.mode != "train":
+            raise ValueError("partial rollout is a training option")
+        return super().build(*args, **kwargs)
 
     def build_local(
         self, rollout_controller: RolloutController | None = None, judger: Judger | None = None, logger=None
@@ -208,6 +230,10 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
             logger=logger,
             max_concurrent_samples=self.max_concurrent_samples,
             mode=self.mode,
+            environment_provider=self.environment_provider,
+            partial_rollout=self.partial_rollout,
+            partial_pause_timeout=self.partial_pause_timeout,
+            artifact_root=self.artifact_root,
         )
 
 
@@ -221,36 +247,81 @@ class AgentInSandboxLoop(AgentLoop):
         logger=None,
         max_concurrent_samples: int | None = None,
         mode: Literal["train", "eval"] = "train",
+        *,
+        environment_provider: dict[str, Any] | str,
+        partial_rollout: bool = False,
+        partial_pause_timeout: float = 240,
+        artifact_root: str | None = None,
     ):
         if hf_checkpoint is None:
             raise ValueError("hf_checkpoint must be provided for AgentInSandboxLoop.")
         super().__init__(rollout_ctl, sample_params, hf_checkpoint, judger, logger)
-        self.max_concurrent_samples = max_concurrent_samples
-        self._sample_semaphore = asyncio.Semaphore(max_concurrent_samples) if max_concurrent_samples else None
         self.mode = mode
+        self._environment_config = environment_provider
+        self._environment_provider: EnvironmentProvider | None = None
+        self.config = SimpleNamespace(
+            max_concurrent_samples=max_concurrent_samples or 32,
+            mode=mode,
+            partial_rollout=partial_rollout,
+            partial_pause_timeout=partial_pause_timeout,
+            artifact_root=artifact_root,
+        )
+        self._slots = asyncio.Semaphore(self.config.max_concurrent_samples)
+        self._active: set[asyncio.Task] = set()
+        self._paused = False
+        self._admission = asyncio.Event()
+        self._admission.set()
+        self._pause_task: asyncio.Task | None = None
+        self.partial = PartialRuns(self.config, self._execute, self._slots, self.logger)
 
     async def generate_group(self, rollout_state: list[RolloutState], **kwargs) -> list[RolloutState]:
-        async def generate_one(state: RolloutState) -> list[RolloutState]:
-            if self._sample_semaphore is None:
-                samples = await self.generate_sample(state)
-            else:
-                async with self._sample_semaphore:
-                    samples = await self.generate_sample(state)
-            samples = [await self._teacher_scorer.on_sample_ready(sample) for sample in samples]
-            return samples
+        partial = kwargs.get("enable_partial_rollout", False)
+        if partial and not self.config.partial_rollout:
+            raise ValueError("partial rollout requires an explicitly configured resumable runner")
+        if self._paused and self._admission.is_set():
+            return [
+                state if partial and state.status == Status.COMPLETED else aborted(state) for state in rollout_state
+            ]
+        if partial:
+            rollout_state = await self.partial.prepare_group(rollout_state)
+        slots = self._slots
+        # XTuner versions supporting teacher scoring install this optional hook
+        # through AgentLoopConfig.build.
+        teacher = getattr(self, "_teacher_scorer", None)
 
-        pending_tasks = []
-        for state in rollout_state:
-            state.sample_params = self.sample_params
-            task = create_task(generate_one(state))
-            pending_tasks.append(task)
-        generated_samples = asyncio.gather(*pending_tasks)
-        sample_groups = await generated_samples
-        samples = [sample for sample_group in sample_groups for sample in sample_group]
-        samples = _drop_failed_train_samples(samples, self.mode)
+        async def generate(state: RolloutState) -> list[RolloutState]:
+            try:
+                if partial and state.status == Status.COMPLETED:
+                    return [state]
+                await self._admission.wait()
+                state.sample_params = state.sample_params or self.sample_params
+                if partial:
+                    samples = await self.generate_sample(state, **kwargs)
+                else:
+                    async with slots:
+                        samples = await self.generate_sample(state, **kwargs)
+                return [await teacher.on_sample_ready(sample) for sample in samples] if teacher else samples
+            except asyncio.CancelledError:
+                return [aborted(state)]
+
+        jobs = [asyncio.create_task(generate(state)) for state in rollout_state]
+        self._active.update(jobs)
+        try:
+            groups = await asyncio.gather(*jobs)
+        finally:
+            for job in jobs:
+                if not job.done():
+                    job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+            self._active.difference_update(jobs)
+        samples = [sample for group in groups for sample in group]
         samples = maybe_filter_invalid_sample(samples, self.is_valid_sample_fn, self.logger)
-        samples = await self._teacher_scorer.on_group_ready(samples)
-        return self.canonicalize_train_fields(samples)
+        samples = await teacher.on_group_ready(samples) if teacher else samples
+        samples = self.canonicalize_train_fields(samples)
+        if any(sample.status in (Status.FAILED, Status.FILTERED) for sample in samples):
+            # Producer discards the whole group; no retained sibling can be resumed.
+            await self.partial.discard(samples)
+        return samples
 
     def canonicalize_train_fields(self, group: list[RolloutState]) -> list[RolloutState]:
         """Validate the canonical training fields of one sandbox agentic
@@ -284,42 +355,186 @@ class AgentInSandboxLoop(AgentLoop):
             except Exception as exc:
                 self.logger.error(f"Canonicalize train fields failed for rollout_id={state.rollout_id}: {exc}")
                 state.status = Status.FAILED
+                state.reward = None
                 state.error_msg = f"canonicalize_train_fields failed: {exc}"
         for state in group:
             write_train_meta(state)
         return group
 
-    # NOTE: A single sandbox session may yield multiple trainable segments, so this returns a list
-    # rather than the base class's single RolloutState. The base contract is never exercised for
-    # this loop (generate_group is the only entry point), so we override the return type here.
-    @trace_rollout_endpoint("agent_in_sandbox_loop.generate_sample")
-    async def generate_sample(  # type: ignore[override]
-        self, rollout_state: RolloutState, **kwargs
-    ) -> list[RolloutState]:
+    @trace_rollout_endpoint("agent_in_sandbox_loop.generate_sample", target_arg="state")
+    async def generate_sample(self, state: RolloutState, **kwargs) -> list[RolloutState]:  # type: ignore[override]
+        if self.partial.closing:
+            raise RuntimeError("Agent episode loop is closed")
+        if kwargs.get("enable_partial_rollout", False):
+            if not self.config.partial_rollout:
+                raise ValueError("partial rollout requires an explicitly configured resumable runner")
+            return await self.partial.generate(state)
+        if self._paused:
+            return [aborted(state)]
+        current = asyncio.current_task()
+        owns_tracking = current is not None and current not in self._active
+        if owns_tracking:
+            self._active.add(current)
         try:
-            rollout_item = rollout_state.extra_fields["rollout_item"].model_copy(deep=True)
-            if rollout_state.session_id is None:
-                rollout_state.session_id = uuid.uuid4().int
-            rollout_item.uid = rollout_state.session_id
-            rollout_item.group_id = rollout_state.group_id
-            result = await self._run_item(rollout_item)
-            return await self._build_rollout_states(rollout_state, result)
-        except Exception as exc:
-            rollout_state.status = Status.COMPLETED if self.mode == "eval" else Status.FAILED
-            rollout_state.finish_reason = "error"
-            if self.mode == "eval":
-                rollout_state.reward = {"score": 0.0}
-                rollout_state.response = ""
-                rollout_state.extra_fields["agent_status"] = "exception"
-            rollout_state.error_msg = f"{type(exc).__name__}: {exc}"
-            self.logger.error(f"[AgentInSandboxLoop] failed: {exc}\n{traceback.format_exc()}")
-            return [rollout_state]
+            return await self._execute(state)
+        finally:
+            if owns_tracking:
+                self._active.discard(current)
 
-    async def _run_item(self, item: AgentRolloutItem) -> AgentRolloutItem:
-        runner = _resolve_runner(item.pipeline, str(item.uid))
-        if runner is None:
-            raise ValueError("AgentRolloutItem.pipeline is required.")
-        return await runner.run(item)
+    async def prepare_pause(self) -> None:
+        """Close request admission and drain before global inference abort."""
+        self._admission.clear()
+        await self.pause()
+
+    async def resume(self) -> None:
+        self._admission.set()
+
+    async def pause(self) -> None:
+        if self._pause_task is None or self._pause_task.done():
+            self._pause_task = asyncio.create_task(self._pause())
+        await asyncio.shield(self._pause_task)
+
+    async def _pause(self) -> None:
+        self._paused = True
+        try:
+            await self.partial.pause()
+            active = tuple(self._active)
+            for task in active:
+                if task not in self.partial.waiters:
+                    task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+        finally:
+            self._paused = False
+
+    async def close(self) -> None:
+        self.partial.closing = True
+        self._admission.clear()
+        if self._pause_task and not self._pause_task.done():
+            self._pause_task.cancel()
+            await asyncio.gather(self._pause_task, return_exceptions=True)
+        await self.partial.close()
+        try:
+            await self.pause()
+        finally:
+            if self._environment_provider is not None:
+                await self._environment_provider.close()
+                self._environment_provider = None
+
+    def _provider(self) -> EnvironmentProvider:
+        if self._environment_provider is None:
+            config = self._environment_config
+            if isinstance(config, str):
+                config = _import_from_path(config)
+            self._environment_provider = create_object(copy.deepcopy(config))
+        return self._environment_provider
+
+    async def _execute(self, state: RolloutState, *, partial=None) -> list[RolloutState]:
+        # A reroll is a new attempt, not an extension of stale training tensors.
+        for name in (
+            "input_ids",
+            "labels",
+            "response_ids",
+            "response_model_steps",
+            "logprobs",
+            "routed_experts",
+            "teacher_targets",
+            "response",
+            "tool_calls",
+            "reward",
+            "error_msg",
+            "finish_reason",
+            "position_ids",
+        ):
+            setattr(state, name, None)
+        for name in tuple(state.extra_fields):
+            if name.startswith("agent_") and name != "agent_partial_handle":
+                state.extra_fields.pop(name)
+        item = None
+        trace_diagnostics = None
+        try:
+            item = state.extra_fields["rollout_item"].model_copy(deep=True)
+            # A new execution attempt needs a fresh inference session even when
+            # replay supplies a completed/expired state from an earlier attempt.
+            state.session_id = uuid.uuid4().int
+            item.uid, item.group_id = state.session_id, state.group_id
+            item.execution = EpisodeContext(partial, lambda segments: self.partial_trace(state, segments))
+            runner = _resolve_runner(item.pipeline, str(item.uid))
+            if runner is None:
+                raise ValueError("AgentRolloutItem.pipeline is required")
+            async with self._provider().open(item) as environment:
+                state.extra_fields["agent_session_id"] = state.session_id
+                state.extra_fields["agent_environment"] = item.metadata.get("environment_id")
+                result = await runner.run(item, environment)
+                state.extra_fields["agent_environment"] = item.infer.sandbox_env_id
+                await environment.check()
+                async with partial.completion() if partial is not None else nullcontext():
+                    samples = await self._build_rollout_states(state, result)
+                    if partial is not None and result.status == RolloutStatus.COMPLETED:
+                        traces = [
+                            TraceTokens.from_trace(
+                                {
+                                    "input_ids": sample.input_ids,
+                                    "labels": sample.labels,
+                                    "logprobs": sample.logprobs,
+                                }
+                            )
+                            for sample in samples
+                        ]
+                        for sample, versions in zip(samples, partial.segment_versions(traces), strict=True):
+                            sample.response_model_steps = response_prefix_versions(sample, versions)
+                            sample.extra_fields["agent_partial_pauses"] = partial.pauses
+                await environment.check()
+            return samples
+        except asyncio.CancelledError:
+            if state.extra_fields.get("agent_partial_error"):
+                state.status, state.reward = Status.FAILED, None
+                state.error_msg = "partial pause failed: " + state.extra_fields["agent_partial_error"]
+                return [state]
+            return [aborted(state)]
+        except Exception as exc:
+            if isinstance(exc, TracePending):
+                trace_diagnostics = exc.diagnostics
+            state.status, state.reward, state.finish_reason = Status.FAILED, None, "error"
+            state.error_msg = f"{type(exc).__name__}: {exc}"
+            self.logger.error(f"[AgentInSandboxLoop] failed: {exc}\n{traceback.format_exc()}")
+            return [state]
+        finally:
+            if item is not None and self.config.artifact_root:
+                from pathlib import Path
+
+                directory = Path(self.config.artifact_root) / str(item.uid)
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / "infer-stage.json").write_text(item.infer.model_dump_json(indent=2))
+                    (directory / "judgers.json").write_text(
+                        json.dumps(
+                            {name: record.model_dump(mode="json") for name, record in item.judgers.items()}, indent=2
+                        )
+                    )
+                    if state.status == Status.FAILED:
+                        evidence = {
+                            "task_id": item.id,
+                            "group_id": str(item.group_id) if item.group_id is not None else None,
+                            "session_id": str(state.session_id),
+                            "environment_id": state.extra_fields.get("agent_environment"),
+                            "error": state.error_msg,
+                            "finish_reason": state.finish_reason,
+                            "trace": trace_diagnostics,
+                            "artifacts": {
+                                key: _to_json_safe(item.artifacts[key])
+                                for key in ("messages", "response_message")
+                                if key in item.artifacts
+                            },
+                        }
+                        path = directory / "failure.json"
+                        # Includes task/model text. A fresh session owns this
+                        # path; do not follow or overwrite an existing file.
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w") as stream:
+                            json.dump(evidence, stream, indent=2)
+                        state.extra_fields["agent_failure_evidence"] = str(path)
+                except OSError:
+                    self.logger.exception("Unable to persist episode stage evidence")
 
     async def _build_rollout_states(self, rollout_state: RolloutState, item: AgentRolloutItem) -> list[RolloutState]:
         if self.mode == "eval":
@@ -334,7 +549,7 @@ class AgentInSandboxLoop(AgentLoop):
         rollout_state.finish_reason = str(
             response_message.get("finish_reason") or ("stop" if item.status == RolloutStatus.COMPLETED else "error")
         )
-        rollout_state.reward = _extract_reward_payload(item)
+        rollout_state.reward = _extract_reward_payload(item) if rollout_state.status == Status.COMPLETED else None
         rollout_state.extra_fields["origin_data_source"] = item.data_source
         rollout_state.extra_fields["agent_status"] = item.status.value
         selected_agent = _selected_agent(item)
@@ -355,62 +570,35 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_state.extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
             return [rollout_state]
 
-        segments = _load_train_trace_segments(item.artifacts)
-        if not segments:
+        segments = _load_messages_artifact(item.artifacts)
+        branches = await self._trace_branches(rollout_state, segments, require_assistant=True)
+        if not branches:
             raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-
-        rollout_states: list[RolloutState] = []
-        trace_store = get_store()
-        for segment_index, (messages, tools) in enumerate(segments):
-            if not messages:
-                raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
-            segment_state = rollout_state.model_copy(deep=True)
-            segment_state.extra_fields["agent_messages"] = messages
-            segment_state.extra_fields["agent_tools"] = tools
-            segment_state.extra_fields["agent_tool_turns"] = _count_tool_turns(messages)
-            segment_state.extra_fields["agent_trace_segment_index"] = segment_index
-            segment_state.extra_fields["agent_trace_segment_count"] = len(segments)
-            segment_state.extra_fields["agent_session_id"] = rollout_state.session_id
-
-            text = self.tokenizer.apply_chat_template(
-                canonicalize_messages_for_chat_template(messages),
-                tools=tools,
-                tokenize=False,
-                add_generation_prompt=False,
+        rollout_states = []
+        for index, (prompt, messages, tools) in enumerate(branches):
+            sample = rollout_state.model_copy(deep=True)
+            data = await get_store().export_training_trace.remote(str(rollout_state.session_id), prompt)
+            apply_training_trace(sample, data)
+            sample.response = self.tokenizer.decode(sample.response_ids)
+            sample.extra_fields.update(
+                agent_messages=messages,
+                agent_tools=tools,
+                agent_tool_turns=_count_tool_turns(messages),
+                agent_trace_segment_index=index,
+                agent_trace_segment_count=len(branches),
+                agent_session_id=rollout_state.session_id,
             )
-            prompt_text = text[:-1] if text.endswith("\n") else text
-            data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
-            segment_state.input_ids = data["input_ids"]
-            segment_state.labels = data["labels"]
-            # Unified response_ids convention: the contiguous suffix of input_ids after the prompt
-            # (env-injected tokens included), aligned with response_model_steps for per-token
-            # staleness; also the token count used by rollout throughput logging.
-            prompt_len = len(segment_state.prompt_ids or [])
-            segment_state.response_ids = list(data["input_ids"][prompt_len:])
-            segment_state.logprobs = data["logprobs"]
-            # ``routed_experts`` is a per-node list for a MoE trace or ``None`` for a dense one; trace_store's
-            # ``_resolve_routed_experts`` already enforces the all-or-nothing invariant (a trace mixing MoE turns with
-            # missing-expert turns raises there and the sample is dropped as FAILED), so we pass it through as-is.
-            # TODO(incomplete): a MoE run that produced routed experts for *no* node collapses to ``None`` here and is
-            # indistinguishable from a dense trace; catching that would need the MoE-vs-dense signal the loop lacks
-            # (session_server gates on ``enable_return_routed_experts``).
-            segment_state.routed_experts = data["routed_experts"]
-            segment_state.routed_experts_owner = "trace_store" if data["routed_experts"] is not None else None
-            if segment_state.response_ids:
-                segment_state.response = self.tokenizer.decode(segment_state.response_ids)
-            else:
-                segment_state.response = _response_text(response_message)
-            rollout_states.append(segment_state)
+            rollout_states.append(sample)
 
         rollout_states[0].extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
-        is_success = item.status == RolloutStatus.COMPLETED
-        response_message = _response_message(item.artifacts, required=is_success)
-        rollout_state.status = Status.COMPLETED
+        response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
+        is_success = item.status == RolloutStatus.COMPLETED and response_message.get("finish_reason") != "timeout"
+        rollout_state.status = Status.COMPLETED if is_success else Status.FAILED
         rollout_state.finish_reason = str(response_message.get("finish_reason") or ("stop" if is_success else "error"))
-        rollout_state.reward = {"score": item.reward if is_success and item.reward is not None else 0.0}
+        rollout_state.reward = {"score": item.reward} if is_success and item.reward is not None else None
         rollout_state.input_ids = None
         rollout_state.labels = None
         rollout_state.response_ids = None
@@ -443,3 +631,46 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_state.extra_fields["agent_messages"] = messages
             rollout_state.extra_fields["agent_tools"] = tools
             rollout_state.extra_fields["agent_tool_turns"] = _count_tool_turns(messages)
+
+    async def _trace_branches(self, state, segments, *, require_assistant=False):
+        store = get_store()
+        # A drained gate guarantees the store has committed every response.
+        # Agent recording happens later. Check every recorded response, rather
+        # than assistant counts (branches can repeat a shared history).
+        keys = await store.keys.remote(str(state.session_id))
+        branches = training_segments(self.tokenizer, segments, require_assistant=require_assistant, stored_keys=keys)
+        prompts = [key for key, _, _ in branches]
+        missing = [key for key in keys if not any(prompt.startswith(key) for prompt in prompts)]
+        if missing:
+            # A failed/cancelled request may leave a prompt-only node. Require
+            # coverage of every real response token, not every masked input.
+            # Use exact stored provenance; never synthesize tokens/logprobs.
+            async def recorded(key):
+                trace = TraceTokens.from_trace(await store.export_training_trace.remote(str(state.session_id), key))
+                return dict(zip(trace.keys, zip(trace.tokens, trace.logprobs, strict=True), strict=True))
+
+            covered = {}
+            for prompt in prompts:
+                covered.update(await recorded(prompt))
+            for key in missing:
+                uncovered = sum(covered.get(token_key) != value for token_key, value in (await recorded(key)).items())
+                if uncovered:
+                    raise TracePending(
+                        "waiting for the agent to record all completed inference branches",
+                        diagnostics={
+                            "stored_branches": len(keys),
+                            "matched_branches": len(prompts),
+                            "covered_response_tokens": len(covered),
+                            "uncovered_response_tokens": uncovered,
+                            "missing_trace_key": key,
+                        },
+                    )
+        return branches
+
+    async def partial_trace(self, state, segments):
+        prompts = [key for key, _, _ in await self._trace_branches(state, segments)]
+        store = get_store()
+        return [
+            TraceTokens.from_trace(await store.export_training_trace.remote(str(state.session_id), prompt))
+            for prompt in prompts
+        ]
