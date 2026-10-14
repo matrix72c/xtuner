@@ -391,6 +391,12 @@ class AgentLoop(ABC):
         finally:
             await cancel_and_drain([pause_task])
 
+    async def prepare_pause(self) -> None:
+        """Drain external model requests before the manager aborts inference."""
+
+    async def resume(self) -> None:
+        """Reopen external request admission after inference resumes."""
+
     async def close(self) -> None:
         """Release loop-owned resources during framework shutdown."""
 
@@ -454,6 +460,12 @@ class RouterAgentLoop:
             *(worker.pause.remote() for worker in self.workers),
         )
 
+    async def prepare_pause(self) -> None:
+        await asyncio.gather(*(worker.prepare_pause.remote() for worker in self.workers))
+
+    async def resume(self) -> None:
+        await asyncio.gather(*(worker.resume.remote() for worker in self.workers))
+
 
 async def get_agent_loop_rollout_ctl(agent_loop: AgentLoopSpec) -> RolloutController:
     rollout_ctl = getattr(agent_loop, "rollout_ctl", None)
@@ -512,6 +524,14 @@ class AgentLoopActor:
     @ray_method
     async def pause(self) -> None:
         return await self.agent_loop.pause()
+
+    @ray_method
+    async def prepare_pause(self) -> None:
+        await self.agent_loop.prepare_pause()
+
+    @ray_method
+    async def resume(self) -> None:
+        await self.agent_loop.resume()
 
 
 RayAgentLoop = cast(

@@ -32,6 +32,7 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
             rollout_id=7,
             session_id=12345678901234567890,
             message=[{"role": "user", "content": "test"}],
+            prompt_ids=[1],
             num_tokens=1,
             extra_fields={},
         )
@@ -70,6 +71,7 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
         loop = AgentInSandboxLoop.__new__(AgentInSandboxLoop)
         loop.mode = mode
         loop.tokenizer = MagicMock()
+        loop.tokenizer.eos_token = None
         loop.tokenizer.apply_chat_template.side_effect = lambda messages, **_: f"rendered-{messages[-1]['content']}\n"
         loop.tokenizer.decode.side_effect = lambda token_ids: f"decoded-{token_ids[-1]}"
         return loop
@@ -85,7 +87,12 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
             }
             for index in range(segment_count)
         ]
-        return SimpleNamespace(export_training_trace=SimpleNamespace(remote=AsyncMock(side_effect=traces)))
+        return SimpleNamespace(
+            keys=SimpleNamespace(
+                remote=AsyncMock(return_value=[f"rendered-segment-{index}" for index in range(segment_count)])
+            ),
+            export_training_trace=SimpleNamespace(remote=AsyncMock(side_effect=traces)),
+        )
 
     async def test_completed_session_assigns_artifacts_only_to_first_segment(self):
         loop = self._make_loop()

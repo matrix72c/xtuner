@@ -89,6 +89,8 @@ def _build_fake_agent_loop():
     rollout_ctl = _build_fake_rollout_controller()
     agent_loop = MagicMock()
     agent_loop.close = AsyncMock()
+    agent_loop.prepare_pause = AsyncMock()
+    agent_loop.resume = AsyncMock()
     agent_loop.rollout_ctl = rollout_ctl
 
     async def generate_group(rollout_states, **kwargs):

@@ -200,6 +200,9 @@ class AgentRolloutItem(BaseModel):
     pipeline: PipelineConfig | Any | None = None
     environment: dict[str, Any] = Field(default_factory=dict)
 
+    # Runtime-only coordination installed by the loop, never dataset state.
+    execution: Any = Field(default=None, exclude=True, repr=False)
+
     # Output and observation.
     status: RolloutStatus = RolloutStatus.PENDING
     reward: float | None = None

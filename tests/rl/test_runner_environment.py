@@ -254,9 +254,7 @@ async def test_closed_provider_rejects_new_episode():
 
 
 @pytest.mark.asyncio
-async def test_loop_close_cancels_episode_before_closing_provider():
-    from xtuner.v1.rl.agent_loop.sandbox_agent_loop import AgentInSandboxLoop
-
+async def test_loop_close_cancels_episode_before_closing_provider(monkeypatch):
     source = provider([])
     started = asyncio.Event()
     clients = []
@@ -267,21 +265,27 @@ async def test_loop_close_cancels_episode_before_closing_provider():
             started.set()
             await asyncio.Event().wait()
 
-    loop = AgentInSandboxLoop.__new__(AgentInSandboxLoop)
-    loop._active_runs = set()
-    loop._closing = False
-    loop._close_task = None
+    from types import SimpleNamespace
+
+    from xtuner.v1.data_proto.rl_data import RolloutState, Status
+    from xtuner.v1.rl.agent_loop import agent_loop
+    from xtuner.v1.rl.agent_loop.sandbox_agent_loop import AgentInSandboxLoopConfig
+
+    monkeypatch.setattr(agent_loop, "load_tokenizer", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(agent_loop, "load_processor", lambda *a, **k: None)
+    loop = AgentInSandboxLoopConfig(hf_checkpoint="unused", environment_provider={}).build_local()
     loop._environment_provider = source
-    task = asyncio.create_task(loop._run_item(item(pipeline=runner([Wait()]))))
+    state = RolloutState(message=[], extra_fields={"rollout_item": item(pipeline=runner([Wait()]))})
+    task = asyncio.create_task(loop.generate_sample(state))
     await asyncio.wait_for(started.wait(), 2)
     await asyncio.gather(loop.close(), loop.close())
-    assert task.cancelled()
-    assert not loop._active_runs
+    assert (await task)[0].status == Status.ABORTED
+    assert not loop._active
     assert source._closed
     assert not source._pools
     assert any(event.startswith("delete:") for event in clients[0].events)
-    with pytest.raises(RuntimeError, match="closing"):
-        await loop._run_item(item(pipeline=runner()))
+    with pytest.raises(RuntimeError, match="closed"):
+        await loop.generate_sample(state)
 
 
 def test_trainer_fit_closes_both_managers_even_on_failure():

@@ -64,10 +64,10 @@ def test_confirmed_task_timeout_uses_verifier_score(mode, score):
 def test_execution_exception_discards_stale_reward_and_preserves_evidence(mode):
     loop, state = Fixtures._make_loop(mode), Fixtures._make_state()
     loop.logger = MagicMock()
-    loop._run_item = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    _configure_execution(loop, fail_cleanup=True)
     state.extra_fields["rollout_item"] = Fixtures._make_item(RolloutStatus.COMPLETED)
     state.reward = {"score": 1}
-    result = asyncio.run(loop.generate_sample(state))
+    result = asyncio.run(loop._execute(state))
     assert result[0].status == Status.FAILED
     assert result[0].reward is None
     assert result[0].extra_fields["agent_artifacts"]["response_message"]["content"] == "done"
@@ -77,8 +77,45 @@ def test_scored_episode_without_trace_is_not_trainable():
     loop, state = Fixtures._make_loop(), Fixtures._make_state()
     loop.logger = MagicMock()
     item = Fixtures._make_item(RolloutStatus.COMPLETED, segment_count=0)
-    loop._run_item = AsyncMock(return_value=item)
+    _configure_execution(loop)
     state.extra_fields["rollout_item"] = item
-    result = asyncio.run(loop.generate_sample(state))
+    result = asyncio.run(loop._execute(state))
     assert result[0].status == Status.FAILED
     assert result[0].reward is None
+
+
+def _configure_execution(loop, *, fail_cleanup=False):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    @asynccontextmanager
+    async def open_environment(item):
+        yield SimpleNamespace(check=AsyncMock())
+        if fail_cleanup:
+            raise RuntimeError("cleanup failed")
+
+    if fail_cleanup:
+        loop._build_rollout_states = AsyncMock(return_value=[])
+    loop.config = SimpleNamespace(artifact_root=None)
+    loop._provider = lambda: SimpleNamespace(open=open_environment)
+    # Fixture's pipeline is otherwise intentionally absent. Resolve a runner
+    # that leaves its completed verifier/artifact evidence intact.
+    # _execute resolves the runner before opening its environment.
+    from unittest.mock import patch
+
+    async def run(item, environment):
+        return item
+
+    loop._resolve_patch = patch(
+        "xtuner.v1.rl.agent_loop.sandbox_agent_loop.agent_in_sandbox_loop._resolve_runner",
+        return_value=SimpleNamespace(run=run),
+    )
+    # The tests call _execute immediately and always stop this patch in their
+    # local helper wrapper below.
+    execute = loop._execute
+
+    async def wrapped(state):
+        with loop._resolve_patch:
+            return await execute(state)
+
+    loop._execute = wrapped
