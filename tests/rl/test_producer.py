@@ -276,10 +276,12 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
             message=[{"role": "user", "content": "prompt"}],
             prompt_ids=[1],
             tokens=[1, 11],
+            input_ids=[1, 11],
+            labels=[-100, 11],
             response="old response",
             response_ids=[11],
             response_model_steps=[3],
-            logprobs=[0.1],
+            logprobs=[0.0, 0.1],
             finish_reason="stop",
             reward={"score": 1.0},
             status=Status.COMPLETED,
@@ -769,6 +771,11 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         fresh.logprobs = [-0.2]
         fresh.reward = {"score": 0.9}
 
+        for state in (expired, fresh):
+            state.input_ids = state.prompt_ids + state.response_ids
+            state.labels = [-100] * len(state.prompt_ids) + state.response_ids
+            state.logprobs = [0.0] * len(state.prompt_ids) + list(state.logprobs or [0.0] * len(state.response_ids))
+
         await self.replay_buffer.put(
             [expired, fresh],
             task_name,
@@ -788,7 +795,9 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
                 generated_rollout_ids.append(state.rollout_id)
                 state.response = "rerolled response"
                 state.response_ids = [31]
-                state.logprobs = [-0.1]
+                state.input_ids = state.prompt_ids + state.response_ids
+                state.labels = [-100] * len(state.prompt_ids) + state.response_ids
+                state.logprobs = [0.0] * len(state.prompt_ids) + [-0.1]
                 state.reward = {"score": 0.2}
                 state.finish_reason = "stop"
                 state.status = Status.COMPLETED
@@ -822,7 +831,7 @@ class TestProducer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed[0][1].response, "fresh response")
         self.assertEqual(completed[0][1].response_ids, [21])
         self.assertEqual(completed[0][1].response_model_steps, [5])
-        self.assertEqual(completed[0][1].logprobs, [-0.2])
+        self.assertEqual(completed[0][1].logprobs, [0.0, -0.2])
 
     async def test_async_produce_strategy_fails_fast_on_invalid_progress(self):
         # 验证 progress 缺少当前 task key 时 fail fast，避免静默用 0 掩盖调度状态损坏。
