@@ -953,18 +953,18 @@ class BaseRLTrainer:
                 with timer("resume_train_nccl", step_timer_dict):
                     self.train_controller.resume_train_nccl_process_groups()
                 self._train_nccl_suspended = False
-
-        # fit内部再做worker的onload，ppo onload critic, 其他的onload actor
-        with timer("training", step_timer_dict):
-            workers_log_item, data_info = self.train_controller.fit(
-                train_batch,
-                pack_max_length=self._train_worker_cfg.pack_max_length,
-                rollout_idx=train_step,
-                raw_rewards_sum=raw_rewards_sum,
-                raw_rewards_count=raw_rewards_count,
-            )
-
-        self._release_trace_sessions_after_train_batch(train_batch)
+        try:
+            # Controller owns role-specific onload and data preparation.
+            with timer("training", step_timer_dict):
+                workers_log_item, data_info = self.train_controller.fit(
+                    train_batch,
+                    pack_max_length=self._train_worker_cfg.pack_max_length,
+                    rollout_idx=train_step,
+                    raw_rewards_sum=raw_rewards_sum,
+                    raw_rewards_count=raw_rewards_count,
+                )
+        finally:
+            self._release_trace_sessions_after_train_batch(train_batch)
 
         return {
             "data_info": data_info,
