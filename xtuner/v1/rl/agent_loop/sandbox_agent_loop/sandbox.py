@@ -836,8 +836,8 @@ class _SandboxLease:
 class SandboxPool:
     """Per-run sandbox pool with transactional dependency groups.
 
-    One ``SandboxPool`` instance is created at the start of ``Runner.run`` and
-    released in the ``finally`` block.  The pool owns:
+    One ``SandboxPool`` instance is created per episode by the environment
+    provider and released when the episode context exits.  The pool owns:
 
       - every ``provider.create`` / ``provider.delete`` and client close
       - rate limiting, health polling, group retry, and reverse-order rollback
@@ -1091,19 +1091,23 @@ async def exec_in(
 
     Raises on failure by default.
     """
-    if env:
-        command = _expand_vars(command, env)
-        # Use `export` so vars carry across chained commands (`bash A && bash B`).
-        # Inline `VAR=val cmd1 && cmd2` scopes VAR to cmd1 only, which bites
-        # when an entry wrapper starts child processes that still need the
-        # stage env (RL_LLM_MODEL, TASK_WORKSPACE, etc.).
-        exports = "; ".join(f'export {k}="{v}"' for k, v in env.items())
-        command = f"{exports}; {command}"
-    result = await client.execute(command, cwd, timeout_sec, detach)
+    # Backends with structured environment support keep credentials out of argv
+    # and preserve per-entry scope. Legacy clients retain their existing shell
+    # transport until they implement execute_with_env.
+    execute_with_env = getattr(client, "execute_with_env", None)
+    display_command = command
+    if execute_with_env is not None:
+        result = await execute_with_env(command, cwd, timeout_sec, detach, env=dict(env or {}))
+    else:
+        if env:
+            command = _expand_vars(command, env)
+            exports = "; ".join(f"export {k}={shlex.quote(v)}" for k, v in env.items())
+            command = f"{exports}; {command}"
+        result = await client.execute(command, cwd, timeout_sec, detach)
     rc = _result_code(result)
     if raise_on_error and rc != 0:
         raise RuntimeError(
-            f"command failed (return_code={rc}): {command}\n"
+            f"command failed (return_code={rc}): {display_command}\n"
             f"stdout: {result.get('stdout', '')}\n"
             f"stderr: {result.get('stderr', '')}"
         )
