@@ -417,6 +417,7 @@ class AgentInSandboxLoop(AgentLoop):
                 raise ValueError("AgentRolloutItem.pipeline is required")
             async with self._provider().open(item) as environment:
                 state.extra_fields["agent_session_id"] = state.session_id
+                state.extra_fields["agent_environment"] = item.metadata.get("environment_id")
                 result = await runner.run(item, environment)
                 state.extra_fields["agent_environment"] = item.infer.sandbox_env_id
                 await environment.check()
@@ -471,11 +472,14 @@ class AgentInSandboxLoop(AgentLoop):
             return [rollout_state]
 
         response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
-        rollout_state.status = Status.COMPLETED if item.status == RolloutStatus.COMPLETED else Status.FAILED
+        timed_out = response_message.get("finish_reason") == "timeout"
+        rollout_state.status = (
+            Status.COMPLETED if item.status == RolloutStatus.COMPLETED and not timed_out else Status.FAILED
+        )
         rollout_state.finish_reason = str(
             response_message.get("finish_reason") or ("stop" if item.status == RolloutStatus.COMPLETED else "error")
         )
-        rollout_state.reward = _extract_reward_payload(item) if item.status == RolloutStatus.COMPLETED else None
+        rollout_state.reward = _extract_reward_payload(item) if rollout_state.status == Status.COMPLETED else None
         rollout_state.extra_fields["origin_data_source"] = item.data_source
         rollout_state.extra_fields["agent_status"] = item.status.value
         selected_agent = _selected_agent(item)
@@ -490,7 +494,9 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_state.extra_fields["agent_finish_info"] = finish_info
         if item.error is not None:
             rollout_state.error_msg = f"{item.error.stage}/{item.error.category}: {item.error.message}"
-        if item.status != RolloutStatus.COMPLETED:
+        elif timed_out:
+            rollout_state.error_msg = "TimeoutError: agent exceeded the configured timeout"
+        if rollout_state.status == Status.FAILED:
             rollout_state.extra_fields["agent_artifacts"] = _to_json_safe(item.artifacts)
             return [rollout_state]
 
@@ -518,8 +524,8 @@ class AgentInSandboxLoop(AgentLoop):
         return rollout_states
 
     def _fill_eval_rollout_state(self, rollout_state: RolloutState, item: AgentRolloutItem) -> None:
-        is_success = item.status == RolloutStatus.COMPLETED
-        response_message = _response_message(item.artifacts, required=is_success)
+        response_message = _response_message(item.artifacts, required=item.status == RolloutStatus.COMPLETED)
+        is_success = item.status == RolloutStatus.COMPLETED and response_message.get("finish_reason") != "timeout"
         rollout_state.status = Status.COMPLETED if is_success else Status.FAILED
         rollout_state.finish_reason = str(response_message.get("finish_reason") or ("stop" if is_success else "error"))
         rollout_state.reward = {"score": item.reward} if is_success and item.reward is not None else None
