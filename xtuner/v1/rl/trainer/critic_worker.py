@@ -17,7 +17,14 @@ from xtuner.v1.rl.loss import CriticLossConfig, CriticLossContext
 from xtuner.v1.utils import get_device, get_torch_device_module
 
 from .pack import DPRankPackIndices
-from .schedule import build_lr_scheduler, optimizer_step_succeeds, partition_indices, pass_order
+from .schedule import (
+    build_lr_scheduler,
+    optimizer_step_succeeds,
+    partition_indices,
+    pass_order,
+    resume_lr_scheduler,
+    save_lr_scheduler,
+)
 from .worker import TrainBatchAttr, WorkerLogItem, WorkerTrainLogItem
 
 
@@ -395,6 +402,7 @@ class CriticWorker:
             weights_dir=checkpoint_path / _SAVE_WEIGHTS_DIR,
             save_optimizer=not no_save_optimizer,
         )
+        save_lr_scheduler(self._scheduler, checkpoint_path)
 
     def resume(
         self,
@@ -402,6 +410,7 @@ class CriticWorker:
         *,
         load_optimizer_states: bool = True,
         load_optimizer_args: bool = True,
+        load_scheduler: bool = True,
     ) -> None:
         """Restore the critic engine from its role-specific checkpoint."""
         checkpoint_path = Path(checkpoint_path)
@@ -413,3 +422,4 @@ class CriticWorker:
             load_states=load_optimizer_states,
             load_args=load_optimizer_args,
         )
+        resume_lr_scheduler(self._scheduler, checkpoint_path, load_scheduler=load_scheduler)
