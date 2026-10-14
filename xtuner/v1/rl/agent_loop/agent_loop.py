@@ -390,6 +390,15 @@ class AgentLoop(ABC):
         finally:
             await cancel_and_drain([pause_task])
 
+    async def prepare_pause(self) -> None:
+        """Drain external model requests before the manager aborts inference."""
+
+    async def resume(self) -> None:
+        """Reopen external request admission after inference resumes."""
+
+    async def close(self) -> None:
+        """Release loop-owned external resources after generation drains."""
+
     async def pause(self) -> None:
         self._judger_pause_event.set()
         try:
@@ -443,6 +452,15 @@ class RouterAgentLoop:
         await asyncio.gather(
             *(worker.pause.remote() for worker in self.workers),
         )
+
+    async def prepare_pause(self) -> None:
+        await asyncio.gather(*(worker.prepare_pause.remote() for worker in self.workers))
+
+    async def resume(self) -> None:
+        await asyncio.gather(*(worker.resume.remote() for worker in self.workers))
+
+    async def close(self) -> None:
+        await asyncio.gather(*(worker.close.remote() for worker in self.workers))
 
 
 async def get_agent_loop_rollout_ctl(agent_loop: AgentLoopSpec) -> RolloutController:
@@ -499,6 +517,18 @@ class AgentLoopActor:
     async def pause(self) -> None:
         return await self.agent_loop.pause()
 
+    @ray_method
+    async def prepare_pause(self) -> None:
+        await self.agent_loop.prepare_pause()
+
+    @ray_method
+    async def resume(self) -> None:
+        await self.agent_loop.resume()
+
+    @ray_method
+    async def close(self) -> None:
+        await self.agent_loop.close()
+
 
 RayAgentLoop = cast(
     ActorClass[AgentLoopActor],
@@ -510,3 +540,18 @@ RayAgentLoop = cast(
 )
 RayAgentLoopProxy: TypeAlias = ActorProxy[AgentLoopActor]
 AgentLoopSpec: TypeAlias = AgentLoop | RayAgentLoopProxy | RouterAgentLoop
+
+
+async def call_agent_loop_hook(agent_loop: AgentLoopSpec, name: str) -> None:
+    """Call an optional resource-lifecycle hook on a local or Ray loop.
+
+    Existing custom loops without resource ownership need not add no-op methods.
+    Exceptions propagate so a failed request drain cannot be followed by a weight
+    update that invalidates the retained episode's token provenance.
+    """
+    method = getattr(agent_loop, name, None)
+    if method is not None:
+        if isinstance(agent_loop, ray.actor.ActorHandle):
+            await method.remote()
+        else:
+            await method()
