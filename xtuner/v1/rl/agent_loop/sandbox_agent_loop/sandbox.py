@@ -1091,22 +1091,34 @@ async def exec_in(
 
     Raises on failure by default.
     """
-    if env:
-        command = _expand_vars(command, env)
-        # Use `export` so vars carry across chained commands (`bash A && bash B`).
-        # Inline `VAR=val cmd1 && cmd2` scopes VAR to cmd1 only, which bites
-        # when an entry wrapper starts child processes that still need the
-        # stage env (RL_LLM_MODEL, TASK_WORKSPACE, etc.).
-        exports = "; ".join(f'export {k}="{v}"' for k, v in env.items())
-        command = f"{exports}; {command}"
-    result = await client.execute(command, cwd, timeout_sec, detach)
+    env = dict(env or {})
+    for key, value in env.items():
+        if not isinstance(key, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None:
+            raise ValueError("environment variable names must be shell identifiers")
+        if not isinstance(value, str) or "\0" in value:
+            raise ValueError("environment variable values must be strings without NUL bytes")
+    display_command = command
+    execute_with_env = getattr(client, "execute_with_env", None)
+    if execute_with_env is not None:
+        result = await execute_with_env(command, cwd, timeout_sec, detach, env=env)
+    else:
+        if env:
+            # Expand variables only in the remote shell, after exporting them.
+            # Text substitution here would execute shell syntax from values.
+            exports = "; ".join(f"export {k}={shlex.quote(v)}" for k, v in env.items())
+            command = f"{exports}; {command}"
+        result = await client.execute(command, cwd, timeout_sec, detach)
     rc = _result_code(result)
     if raise_on_error and rc != 0:
-        raise RuntimeError(
-            f"command failed (return_code={rc}): {command}\n"
+        message = (
+            f"command failed (return_code={rc}): {display_command}\n"
             f"stdout: {result.get('stdout', '')}\n"
             f"stderr: {result.get('stderr', '')}"
         )
+        for value in sorted(set(env.values()), key=len, reverse=True):
+            if value:
+                message = message.replace(value, "<redacted>")
+        raise RuntimeError(message)
     return result
 
 
