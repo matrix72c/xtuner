@@ -103,3 +103,10 @@ class CriticLossConfig(BaseLossConfig):
 ```
 
 有 `old_values` 时，value 相对旧 value 的变化被夹到 `[-cliprange_value, cliprange_value]`。每个 token 取未裁剪平方误差和裁剪后平方误差中较大的一个，再乘 `0.5`。没有 `old_values` 时退化为未裁剪的均方误差。`labels == -100` 的位置权重为 0，其余权重按全局可训练 token 数归一。
+
+## 学习率调度恢复
+
+Actor 和 critic 的调度器按各自成功的 optimizer update 推进，完整 checkpoint 分别保存其状态。
+恢复时 `load_scheduler=True` 会校验学习率类型、warmup、初始学习率和总 update 数保持一致，
+并恢复计数及当前学习率。旧 checkpoint 缺少调度器状态时应显式设置 `load_scheduler=False`，
+从当前配置重新开始调度；不能仅靠 trainer step 推断已成功的 optimizer update 数。
