@@ -32,6 +32,7 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
             rollout_id=7,
             session_id=12345678901234567890,
             message=[{"role": "user", "content": "test"}],
+            prompt_ids=[1],
             num_tokens=1,
             extra_fields={},
         )
@@ -70,6 +71,7 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
         loop = AgentInSandboxLoop.__new__(AgentInSandboxLoop)
         loop.mode = mode
         loop.tokenizer = MagicMock()
+        loop.tokenizer.eos_token = None
         loop.tokenizer.apply_chat_template.side_effect = lambda messages, **_: f"rendered-{messages[-1]['content']}\n"
         loop.tokenizer.decode.side_effect = lambda token_ids: f"decoded-{token_ids[-1]}"
         return loop
@@ -85,7 +87,12 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
             }
             for index in range(segment_count)
         ]
-        return SimpleNamespace(export_training_trace=SimpleNamespace(remote=AsyncMock(side_effect=traces)))
+        return SimpleNamespace(
+            keys=SimpleNamespace(
+                remote=AsyncMock(return_value=[f"rendered-segment-{index}" for index in range(segment_count)])
+            ),
+            export_training_trace=SimpleNamespace(remote=AsyncMock(side_effect=traces)),
+        )
 
     async def test_completed_session_assigns_artifacts_only_to_first_segment(self):
         loop = self._make_loop()
@@ -137,6 +144,24 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(segments, [state])
         self.assertEqual(state.status, Status.FAILED)
+        self.assertEqual(state.extra_fields["agent_artifacts"], item.artifacts)
+
+    async def test_completed_timeout_session_becomes_failed_without_trace(self):
+        loop = self._make_loop()
+        state = self._make_state()
+        item = self._make_item(RolloutStatus.COMPLETED, segment_count=0)
+        item.artifacts["response_message"] = {
+            "content": "",
+            "finish_reason": "timeout",
+        }
+
+        segments = await loop._build_rollout_states(state, item)
+
+        self.assertEqual(segments, [state])
+        self.assertEqual(state.status, Status.FAILED)
+        self.assertEqual(state.finish_reason, "timeout")
+        self.assertIn("not confirmed", state.error_msg)
+        self.assertIsNone(state.reward)
         self.assertEqual(state.extra_fields["agent_artifacts"], item.artifacts)
 
     async def test_eval_session_keeps_artifacts(self):

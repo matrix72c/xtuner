@@ -8,7 +8,6 @@ import ray
 from xtuner.v1.rl.rollout import trace_store as trace_store_module
 from xtuner.v1.rl.rollout.trace_store import (
     RolloutTraceStore,
-    _free_ray_refs,
     get_existing_store,
     release_and_discard_rollout_groups,
     release_existing_sessions,
@@ -19,8 +18,12 @@ class TestRolloutTraceCleanup(unittest.TestCase):
     def test_release_and_discard_detaches_only_trace_owned_refs(self):
         trace_owned_ref = object()
         rollout_owned_ref = object()
-        trace_owned = SimpleNamespace(session_id="trace-owned", routed_experts=trace_owned_ref)
-        rollout_owned = SimpleNamespace(session_id="rollout-owned", routed_experts=rollout_owned_ref)
+        trace_owned = SimpleNamespace(
+            session_id="trace-owned", routed_experts=trace_owned_ref, routed_experts_owner="trace_store"
+        )
+        rollout_owned = SimpleNamespace(
+            session_id="rollout-owned", routed_experts=rollout_owned_ref, routed_experts_owner="rollout"
+        )
         routed_experts_seen_by_discard = {}
 
         def record_discard(item):
@@ -82,6 +85,68 @@ class TestRolloutTraceStore(unittest.TestCase):
         finally:
             ray.kill(store)
 
+    def test_trie_overwrite_drops_handle_without_freeing_borrowed_refs(self):
+        """Overwrite must not free replaced refs: sibling RolloutStates keep
+        their own handles alive via Ray's reference counting."""
+        trie = trace_store_module.Trie()
+        old_ref = ray.put({"value": "old"})
+        new_ref = ray.put({"value": "new"})
+        trie.insert("turn", {"expert_key": old_ref})
+
+        with patch.object(ray.internal, "free") as free:
+            trie.insert("turn", {"expert_key": new_ref})
+
+        free.assert_not_called()
+        # The borrower keeps its own handle: dropping the trie's handle must
+        # not invalidate the object.
+        self.assertEqual(ray.get(old_ref), {"value": "old"})
+        _, nodes = trie.search("turn", filter_none=True)
+        self.assertEqual(ray.get(nodes[-1].value["expert_key"]), {"value": "new"})
+
+    def test_release_keeps_shared_borrowers_readable(self):
+        from xtuner.v1.data_proto.rl_data import RolloutState, discard_rollout_state, reset_rollout_response
+
+        trie = trace_store_module.Trie()
+        shared_ref = ray.put([1, 2, 3])
+        trie.insert("turn-a", {"expert_key": shared_ref})
+        trie.insert("turn-b", {"expert_key": shared_ref})
+        first = RolloutState(message=[], routed_experts=[shared_ref], routed_experts_owner="trace_store")
+        sibling = RolloutState(message=[], routed_experts=[shared_ref], routed_experts_owner="trace_store")
+        reset_rollout_response(first)
+        self.assertEqual(ray.get(sibling.routed_experts[0]), [1, 2, 3])
+        trie.release("turn-a")
+        self.assertEqual(ray.get(sibling.routed_experts[0]), [1, 2, 3])
+        trie.release()
+        trie.release()  # repeated session cleanup
+        self.assertEqual(trie.keys(), [])
+        self.assertEqual(ray.get(sibling.routed_experts[0]), [1, 2, 3])
+        discard_rollout_state(sibling)
+        self.assertIsNone(sibling.routed_experts)
+
+    def test_pending_consumer_survives_session_release_after_failure(self):
+        @ray.remote(num_cpus=0)
+        class Consumer:
+            def hold(self, refs):
+                self.refs = refs
+
+            def consume(self):
+                return ray.get(self.refs[0])
+
+        store = RolloutTraceStore.remote()
+        consumer = Consumer.remote()
+        try:
+            ref = ray.put({"expert": 17})
+            ray.get(store.insert.remote("episode", "turn", {"expert_key": ref}))
+            ray.get(consumer.hold.remote([ref]))
+            # A failed sibling triggers trainer finally cleanup while this
+            # consumer still owns its dispatch and has not read the tensor.
+            ray.get(store.release_sessions.remote(["episode"]))
+            self.assertEqual(ray.get(store.list_sessions.remote()), [])
+            self.assertEqual(ray.get(consumer.consume.remote()), {"expert": 17})
+        finally:
+            ray.kill(consumer)
+            ray.kill(store)
+
     def test_release_existing_sessions_stably_deduplicates_before_rpc(self):
         release_remote = AsyncMock(return_value=["one"])
         store = SimpleNamespace(release_sessions=SimpleNamespace(remote=release_remote))
@@ -104,10 +169,3 @@ class TestRolloutTraceStore(unittest.TestCase):
             return_value=None,
         ):
             self.assertEqual(asyncio.run(release_existing_sessions(["missing"])), set())
-
-    def test_free_ray_refs_recurses_into_nested_containers(self):
-        object_ref = ray.put({"payload": [1, 2, 3]})
-        with patch.object(ray.internal, "free") as free:
-            _free_ray_refs({"outer": [({"inner": object_ref},)]})
-
-        free.assert_called_once_with([object_ref], local_only=False)
