@@ -26,6 +26,7 @@ from xtuner.v1.rl.utils import (
     create_task,
     register_cpu_resources,
 )
+from xtuner.v1.rl.utils.async_utils import CleanupError
 from xtuner.v1.utils import get_logger, ray_method
 from xtuner.v1.utils.processing_utils import load_processor, load_tokenizer
 
@@ -390,6 +391,15 @@ class AgentLoop(ABC):
         finally:
             await cancel_and_drain([pause_task])
 
+    async def prepare_pause(self) -> None:
+        """Drain external model requests before the manager aborts inference."""
+
+    async def resume(self) -> None:
+        """Reopen external request admission after inference resumes."""
+
+    async def close(self) -> None:
+        """Release loop-owned resources during framework shutdown."""
+
     async def pause(self) -> None:
         self._judger_pause_event.set()
         try:
@@ -439,10 +449,22 @@ class RouterAgentLoop:
     def get_worker_status(self) -> dict[str, int]:
         return {str(worker): load for worker, load in self._worker_loads.items()}
 
+    async def close(self) -> None:
+        results = await asyncio.gather(*(worker.close.remote() for worker in self.workers), return_exceptions=True)
+        errors = [result for result in results if isinstance(result, Exception)]
+        if errors:
+            raise CleanupError("Agent worker cleanup failed", errors)
+
     async def pause(self) -> None:
         await asyncio.gather(
             *(worker.pause.remote() for worker in self.workers),
         )
+
+    async def prepare_pause(self) -> None:
+        await asyncio.gather(*(worker.prepare_pause.remote() for worker in self.workers))
+
+    async def resume(self) -> None:
+        await asyncio.gather(*(worker.resume.remote() for worker in self.workers))
 
 
 async def get_agent_loop_rollout_ctl(agent_loop: AgentLoopSpec) -> RolloutController:
@@ -496,8 +518,20 @@ class AgentLoopActor:
         return self.agent_loop.rollout_ctl
 
     @ray_method
+    async def close(self) -> None:
+        await self.agent_loop.close()
+
+    @ray_method
     async def pause(self) -> None:
         return await self.agent_loop.pause()
+
+    @ray_method
+    async def prepare_pause(self) -> None:
+        await self.agent_loop.prepare_pause()
+
+    @ray_method
+    async def resume(self) -> None:
+        await self.agent_loop.resume()
 
 
 RayAgentLoop = cast(
@@ -510,3 +544,21 @@ RayAgentLoop = cast(
 )
 RayAgentLoopProxy: TypeAlias = ActorProxy[AgentLoopActor]
 AgentLoopSpec: TypeAlias = AgentLoop | RayAgentLoopProxy | RouterAgentLoop
+
+
+async def call_agent_loop_hook(agent_loop: AgentLoopSpec, name: str) -> None:
+    """Invoke an optional lifecycle hook locally or on its owning Ray actor."""
+    method = getattr(agent_loop, name, None)
+    if method is not None:
+        if isinstance(agent_loop, ray.actor.ActorHandle):
+            await method.remote()
+        else:
+            await method()
+
+
+async def close_agent_loops(loops: list[AgentLoopSpec]) -> None:
+    """Close every owner even when another owner fails to release resources."""
+    results = await asyncio.gather(*(call_agent_loop_hook(loop, "close") for loop in loops), return_exceptions=True)
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise CleanupError("Agent loop cleanup failed", errors)
