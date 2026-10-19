@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import torch
 
@@ -39,7 +41,69 @@ def build_lr_scheduler(
             return min_factor + 0.5 * (1.0 - min_factor) * (1.0 + math.cos(math.pi * progress))
         raise ValueError(f"Unsupported lr type: {lr_cfg.lr_type}")
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    # LambdaLR does not serialize its closure; validate the reconstructed one.
+    scheduler._xtuner_schedule_spec = {
+        "lr_type": lr_cfg.lr_type,
+        "warmup_ratio": lr_cfg.warmup_ratio,
+        "lr_min": lr_cfg.lr_min,
+        "total_steps": total_steps,
+        "base_lr": base_lr,
+    }
+    return scheduler
+
+
+def save_lr_scheduler(scheduler, checkpoint_path: Path | str) -> None:
+    if scheduler is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    path = Path(checkpoint_path) / "lr_scheduler.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(scheduler.state_dict()) + "\n")
+    temporary.replace(path)
+
+
+def resume_lr_scheduler(scheduler, checkpoint_path: Path | str, *, load_scheduler: bool = True) -> None:
+    """Restore the update clock and LR, or explicitly restart the schedule."""
+    path = Path(checkpoint_path) / "lr_scheduler.json"
+    if load_scheduler:
+        if scheduler is None:
+            if path.exists():
+                raise ValueError("checkpoint has a scheduler but the current worker disables it")
+            return
+        if not path.exists():
+            raise FileNotFoundError(f"Missing {path}; set load_scheduler=False to restart the LR schedule explicitly")
+        state = json.loads(path.read_text())
+        if state.get("_xtuner_schedule_spec") != scheduler._xtuner_schedule_spec:
+            raise ValueError(
+                "checkpoint LR schedule differs from current configuration; use load_scheduler=False to reset"
+            )
+        required = {"last_epoch", "_step_count", "base_lrs", "_last_lr", "lr_lambdas"}
+        if not required.issubset(state):
+            raise ValueError(f"Incomplete LR scheduler state: missing {sorted(required - state.keys())}")
+        if type(state["last_epoch"]) is not int or state["last_epoch"] < 0:
+            raise ValueError("Invalid scheduler update count")
+        if type(state["_step_count"]) is not int or state["_step_count"] < 1:
+            raise ValueError("Invalid scheduler step count")
+        groups = len(scheduler.optimizer.param_groups)
+        for key in ("base_lrs", "_last_lr"):
+            values = state[key]
+            if (
+                not isinstance(values, list)
+                or len(values) != groups
+                or not all(isinstance(lr, (int, float)) and math.isfinite(lr) and lr >= 0 for lr in values)
+            ):
+                raise ValueError(f"Invalid scheduler {key}")
+        if state["lr_lambdas"] != [None] * groups:
+            raise ValueError("Unsupported scheduler closure state")
+        scheduler.load_state_dict(state)
+    if scheduler is not None:
+        # Optimizer argument restore is independently configurable. Do not let
+        # it silently override either a restored or explicitly reset schedule.
+        for group, lr in zip(scheduler.optimizer.param_groups, scheduler.get_last_lr(), strict=True):
+            group["lr"] = lr
 
 
 def optimizer_step_succeeds(engine: TrainEngine, grad_norm: torch.Tensor) -> bool:
