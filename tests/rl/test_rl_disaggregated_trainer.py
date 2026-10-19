@@ -542,11 +542,16 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
         sleeping = {"weights", "kv_cache"}
         weights_received = False
 
+        def wake_weights():
+            self.assertFalse(weights_received, "Allocate weights before receiving the checkpoint")
+            sleeping.remove("weights")
+            events.append("weights_allocated")
+
         def receive_weights():
             nonlocal weights_received
+            self.assertNotIn("weights", sleeping, "NCCL transfer does not clear the engine's sleep tags")
             self.assertIn("kv_cache", sleeping, "Warmup must not run on uninitialized weights")
             weights_received = True
-            sleeping.discard("weights")
             events.append("update_weights")
 
         def wake_kvcache():
@@ -557,6 +562,7 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
         trainer.rollout_controller = SimpleNamespace(
             pause_generation=SimpleNamespace(remote=MagicMock(return_value="pause_generation")),
             continue_generation=SimpleNamespace(remote=MagicMock(return_value="continue_generation")),
+            onload_weights=SimpleNamespace(remote=MagicMock(side_effect=wake_weights)),
             onload_kvcache=SimpleNamespace(remote=MagicMock(side_effect=wake_kvcache)),
         )
         events: list[str] = []
@@ -585,10 +591,10 @@ class TestRLDisaggregatedTrainer(unittest.TestCase):
         trainer.agent_loop_manager.resume.assert_awaited_once_with(Path(self.temp_dir.name))
         trainer.agent_loop_manager.continue_produce.assert_awaited_once_with(model_step=3)
         self.assertTrue(events[0].startswith("manager_resume:"))
-        self.assertEqual(events[1:], ["update_weights", "ready", "continue_produce:3"])
+        self.assertEqual(events[1:], ["weights_allocated", "update_weights", "ready", "continue_produce:3"])
 
     def test_resume_failure_does_not_resume_production(self):
-        for failure in ("weight_update", "onload_kvcache"):
+        for failure in ("onload_weights", "weight_update", "onload_kvcache"):
             with self.subTest(failure=failure):
                 trainer = self._make_trainer(_FakeManager([]))
                 trainer._cur_step = 3
