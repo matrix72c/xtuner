@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 
 import torch
+from torch.distributed.tensor import DTensor
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
@@ -53,6 +54,13 @@ class SwapAdamW(torch.optim.AdamW):
         self._param_to_group_map: dict[torch.Tensor, dict] = {}
         self._param_to_cpu_states_map: dict[torch.Tensor, dict[str, torch.Tensor | None]] = {}
         self._init_swap_states()
+        self.register_load_state_dict_post_hook(self._restore_swap_states)
+
+    def _restore_swap_states(self, optimizer: torch.optim.Optimizer) -> None:
+        # AdamW.load_state_dict replaces both state and param_groups, and casts
+        # moments to the parameter device. Rebuild our aliases and CPU placement
+        # after plain optimizer loads as well as distributed checkpoint loads.
+        self._init_swap_states()
 
     @staticmethod
     def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -61,6 +69,8 @@ class SwapAdamW(torch.optim.AdamW):
         return tensor
 
     def _init_swap_states(self) -> None:
+        self._param_to_group_map.clear()
+        self._param_to_cpu_states_map.clear()
         for group in self.param_groups:
             for param in group["params"]:
                 self._param_to_group_map[param] = group
@@ -86,14 +96,39 @@ class SwapAdamW(torch.optim.AdamW):
                         cpu_state_dtensor[key] = None
                         cpu_state[key] = None
                     else:
-                        cpu_tensor = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-                        cpu_tensor = cpu_tensor.to(device="cpu", non_blocking=True)
-                        cpu_tensor = cpu_tensor.pin_memory()
-                        cpu_state_dtensor[key] = cpu_tensor
+                        restored = cpu_state_dtensor.get(key)
+                        if isinstance(param, DTensor):
+                            if restored is not None and (
+                                not isinstance(restored, DTensor) or restored.shape != param.shape
+                            ):
+                                raise ValueError("Sharded SwapAdamW requires moments with complete DTensor metadata")
+                            # DCP treats plain local tensors as replicated and saves
+                            # only one rank. Keep global shape/placements in state;
+                            # the swap map below aliases its pinned local storage.
+                            state_tensor = torch.empty_like(param, device="cpu", pin_memory=True)
+                            cpu_tensor = state_tensor.to_local()
+                            if restored is None:
+                                cpu_tensor.zero_()
+                            else:
+                                cpu_tensor.copy_(restored.to_local())
+                            cpu_state_dtensor[key] = state_tensor
+                        elif restored is None:
+                            cpu_tensor = torch.zeros_like(
+                                local_param, device="cpu", memory_format=torch.preserve_format
+                            ).pin_memory()
+                            cpu_state_dtensor[key] = cpu_tensor
+                        else:
+                            cpu_tensor = self._to_local_tensor(restored).to(device="cpu").pin_memory()
+                            cpu_state_dtensor[key] = cpu_tensor
                         cpu_state[key] = cpu_tensor
 
                 # Keep per-parameter step semantics consistent with torch.optim.AdamW.
-                cpu_state_dtensor["step"] = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+                step = cpu_state_dtensor.get("step")
+                cpu_state_dtensor["step"] = (
+                    torch.tensor(0.0, dtype=torch.float32, device="cpu")
+                    if step is None
+                    else self._to_local_tensor(step).to(device="cpu", dtype=torch.float32)
+                )
 
                 self._param_to_cpu_states_map[param] = cpu_state
 
