@@ -68,10 +68,10 @@ class Runner:
         t_infer: float | None = None
         t_validate: float | None = None
         try:
-            with span(uid_obs, "run_total", task_id=tid) as total_span:
+            with span(uid_obs, "run_total", task_id=tid, group_id=item.group_id) as total_span:
                 # ─── acquire infer sandbox ───────────────────────────────
                 t0 = time.monotonic()
-                with span(uid_obs, "acquire", task_id=tid) as acquire_span:
+                with span(uid_obs, "acquire", task_id=tid, group_id=item.group_id) as acquire_span:
                     infer_client = await environment.get(infer_sandbox, record=item.infer)
                     item.infer.sandbox_env_id = environment.info(infer_sandbox).environment_id
                     sandbox_url = environment.info(infer_sandbox).url
@@ -82,12 +82,13 @@ class Runner:
                         sandbox_env_id=item.infer.sandbox_env_id,
                         sandbox_url=sandbox_url,
                         sandbox_image=infer_info.image,
+                        sandbox_create_attempts=item.infer.metadata.get("sandbox_create_attempts"),
                     )
                 t_acquire = time.monotonic() - t0
 
                 # ─── infer ──────────────────────────────────────────────
                 t1 = time.monotonic()
-                with span(uid_obs, "infer", task_id=tid) as infer_span:
+                with span(uid_obs, "infer", task_id=tid, group_id=item.group_id) as infer_span:
                     infer_result = await self.infer.run(infer_client, item, item.infer)
                     if not infer_result.ok:
                         infer_span.mark_error(_format_error(item.infer.error))
@@ -98,19 +99,25 @@ class Runner:
 
                 # ─── validate ───────────────────────────────────────────
                 t2 = time.monotonic()
-                with span(uid_obs, "validate", task_id=tid):
+                with span(uid_obs, "validate", task_id=tid, group_id=item.group_id) as validate_span:
                     validate_name = self.validate.name
                     validate_record = item.judgers.setdefault(
                         validate_name,
                         StageRecord(judger_name=validate_name),
                     )
                     score = float(await self.validate.run(item, environment, validate_record))
+                    validate_span.annotate(reward=score)
                 t_validate = time.monotonic() - t2
                 if not math.isfinite(score):
                     raise ValueError("Verifier returned a non-finite score")
                 item.reward = score
 
                 item.status = RolloutStatus.COMPLETED
+                total_span.annotate(
+                    status=item.status.value,
+                    reward=score,
+                    agent_name=item.infer.agent.name if item.infer.agent is not None else None,
+                )
                 return item
         except Exception as exc:
             promoted = (
