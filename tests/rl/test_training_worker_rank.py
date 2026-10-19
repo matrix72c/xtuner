@@ -418,19 +418,19 @@ class TestPackTrainItems(unittest.TestCase):
             response_ids=[20],
         )
         items = _convert(worker, [state], [1.0])
-        self.assertEqual(items[0]["seq_ctx"].input_ids.shape[1], worker.config.pack_max_length)
+        self.assertEqual(items[0][0].input_ids.shape[1], worker.config.pack_max_length)
 
         step_batches = self._pack(worker, items, [[[0]]])
 
         seq_ctx, _ = step_batches[0][0]
-        self.assertIs(seq_ctx, items[0]["seq_ctx"])
+        self.assertIs(seq_ctx, items[0][0])
         self.assertEqual(seq_ctx.num_padding, 0)
 
     def test_empty_pack_materializes_all_padding(self):
         # 调度占位空 pack：整包都是 padding（全零 input_ids + labels=-100 + advantages=0）。
         worker = _make_worker()
 
-        step_batches = self._pack(worker, [], [[]])
+        step_batches = self._pack(worker, [], [[[]]])
 
         seq_ctx, loss_ctx = step_batches[0][0]
         seq_len = seq_ctx.input_ids.shape[1]
@@ -445,7 +445,7 @@ class TestPackTrainItems(unittest.TestCase):
         # pack_loss_keys 声明的批级模板键在空 pack 上也要物化，保证跨 rank collective 形状一致。
         worker = _make_worker()
 
-        step_batches = self._pack(worker, [], [[]], pack_loss_keys=["rollout_logprobs"])
+        step_batches = self._pack(worker, [], [[[]]], pack_loss_keys=["rollout_logprobs"])
 
         _, loss_ctx = step_batches[0][0]
         rollout_logprobs = loss_ctx.loss_kwargs.rollout_logprobs
@@ -465,7 +465,7 @@ class TestPackTrainItems(unittest.TestCase):
         )
         worker = _make_worker(_rollout_distillation_config(loss_config))
 
-        step_batches = self._pack(worker, [], [[]])
+        step_batches = self._pack(worker, [], [[[]]])
 
         _, loss_ctx = step_batches[0][0]
         loss_kwargs = loss_ctx.loss_kwargs
@@ -530,7 +530,7 @@ class TestPackTrainItems(unittest.TestCase):
         # use_3d_position_ids=True 时 padding 区 position_ids 为三轴 arange。
         worker = _make_worker()
 
-        step_batches = self._pack(worker, [], [[]], use_3d=True)
+        step_batches = self._pack(worker, [], [[[]]], use_3d=True)
 
         position_ids = step_batches[0][0][0].position_ids
         self.assertEqual(tuple(position_ids.shape), (3, 1, worker.config.pack_max_length))
@@ -543,7 +543,7 @@ class TestPackTrainItems(unittest.TestCase):
         # has_routed_experts=True 时 padding 区补 dummy expert id，形状与真实 rollout_routed_experts 对齐。
         worker = _make_worker()
 
-        step_batches = self._pack(worker, [], [[]], has_routed_experts=True)
+        step_batches = self._pack(worker, [], [[[]]], has_routed_experts=True)
 
         routed_experts = step_batches[0][0][0].rollout_routed_experts
         self.assertEqual(tuple(routed_experts.shape), (worker.config.pack_max_length, 1, 1))
