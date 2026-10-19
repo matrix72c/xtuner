@@ -1729,7 +1729,12 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
         saved_model_step = asyncio_run(self._resume_agent_loop_manager(checkpoint_path))
         assert self._cur_step == saved_model_step
 
+        # NCCL transfer does not clear the engine's weights sleep tag. Allocate
+        # weights first, then receive the checkpoint before warming the KV cache.
+        ray.get(self.rollout_controller.onload_weights.remote(), timeout=RL_TRAINER_RAY_GET_TIMEOUT)
         self.weight_update()
+        # Empty-init workers need KV cache allocation and warmup before inference.
+        ray.get(self.rollout_controller.onload_kvcache.remote(), timeout=RL_TRAINER_RAY_GET_TIMEOUT)
         asyncio_run(self.agent_loop_manager.continue_produce(model_step=saved_model_step))
 
     def fit(self):
