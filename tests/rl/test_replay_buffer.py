@@ -302,6 +302,11 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                     reward={"score": 0.9},
                 )
 
+                for state in (expired, fresh):
+                    state.input_ids = state.prompt_ids + state.response_ids
+                    state.labels = [-100] * len(state.prompt_ids) + state.response_ids
+                    state.logprobs = [0.0] * len(state.prompt_ids) + state.logprobs
+
                 await replay_buffer.put(
                     [expired, fresh],
                     "task",
@@ -323,7 +328,7 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(group[1].response_model_steps, [4, 4])
                 self.assertEqual(group[1].reward, {"score": 0.9})
 
-    async def test_common_put_skips_token_expiry_for_agentic_group(self):
+    async def test_common_put_applies_token_expiry_for_agentic_group(self):
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
@@ -331,6 +336,8 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                     1,
                     response="agentic response",
                     response_model_steps=[0],
+                    prompt_ids=[1],
+                    response_ids=[2],
                     input_ids=[1, 2],
                     labels=[-100, 2],
                 )
@@ -344,10 +351,10 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                     expired_groups_retryable=True,
                 )
 
-                self.assertEqual(await replay_buffer.count("task", Status.COMPLETED), 1)
-                self.assertEqual(await replay_buffer.count("task", Status.EXPIRED), 0)
-                self.assertEqual(state.status, Status.COMPLETED)
-                self.assertEqual(state.response, "agentic response")
+                self.assertEqual(await replay_buffer.count("task", Status.COMPLETED), 0)
+                self.assertEqual(await replay_buffer.count("task", Status.EXPIRED), 1)
+                self.assertEqual(state.status, Status.EXPIRED)
+                self.assertEqual(state.response, "")
 
     async def test_common_put_seq_expiry_preserves_fresh_group_members(self):
         # seq expiry 路由整组到 EXPIRED pool，但只标记和清理实际过期的 state。
@@ -385,6 +392,11 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 expired = make_rollout_state(1, response_model_steps=[0])
                 fresh = make_rollout_state(2, response_model_steps=[4])
 
+                for state in (expired, fresh):
+                    state.input_ids = state.prompt_ids + state.response_ids
+                    state.labels = [-100] * len(state.prompt_ids) + state.response_ids
+                    state.logprobs = [0.0] * len(state.prompt_ids) + state.logprobs
+
                 await replay_buffer.put(
                     [expired, fresh],
                     "task",
@@ -407,6 +419,11 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 replay_buffer = replay_buffer_config_cls().build()
                 expired = make_rollout_state(1, response_model_steps=[0], reward={"score": 0.1})
                 fresh = make_rollout_state(2, response_model_steps=[4], reward={"score": 0.9})
+                for state in (expired, fresh):
+                    state.input_ids = state.prompt_ids + state.response_ids
+                    state.labels = [-100] * len(state.prompt_ids) + state.response_ids
+                    state.logprobs = [0.0] * len(state.prompt_ids) + state.logprobs
+
                 await replay_buffer.put([expired, fresh], "task")
 
                 expired_counts = await replay_buffer.refresh_staleness(
