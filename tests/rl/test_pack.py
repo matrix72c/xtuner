@@ -154,14 +154,14 @@ class TestRLDataPacker(unittest.TestCase):
     def test_legacy_regroups_when_packs_fewer_than_optimizer_steps(self):
         # packs_per_dp=2 < optimizer_steps=4：旧 worker iters_per_step=ceil(2/4)=1，
         # 实际只训练 2 个 step。
-        lengths = [16, 16, 16, 16]
+        lengths = [self.PACK_MAX_LENGTH] * 4
         packer = self._make_packer(world_size=2, optimizer_steps=4)
 
         plan, padding = packer.pack(lengths)
 
         self.assertEqual(plan, _legacy_reference_plan(lengths, self.PACK_MAX_LENGTH, dp_size=2, optimizer_steps=4))
         self.assertEqual(len(plan[0]), 2)
-        self.assertEqual(padding, 4 * 2 * self.PACK_MAX_LENGTH - sum(lengths))
+        self.assertEqual(padding, 0)
 
     def test_single_pack_interleaves_across_dp(self):
         # 全部样本拼进一个 pack 时，interleaved 分配把唯一 pack 给 rank0，其余 rank 全空 pack。
