@@ -79,7 +79,7 @@ from xtuner.v1.utils.nccl_process_group import resume_nccl_process_groups, suspe
 
 from ..rollout_is import merge_rollout_is_metrics
 from .pack import DPRankPackIndices, TokenTensorBatch
-from .schedule import build_lr_scheduler, optimizer_step_succeeds
+from .schedule import build_lr_scheduler, optimizer_step_succeeds, resume_lr_scheduler, save_lr_scheduler
 
 
 DEVICE = get_device()
@@ -398,7 +398,6 @@ class TrainingWorker(SingleAcceleratorWorker):
         torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
         self.rank = rank
 
-        # TODO: add lr scheduler
         log_dir = worker_cfg.log_dir
         self.log_dir = None
         if log_dir is not None:
@@ -1735,6 +1734,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             weights_dir=weights_path,
             save_optimizer=not no_save_optimizer,
         )
+        save_lr_scheduler(self._lr_scheduler, checkpoint_path)
 
         for name, worker in self._attached.items():
             save_fn = getattr(worker, "save", None)
@@ -1786,6 +1786,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             load_states=load_checkpoint_cfg.load_optimizer_states,
             load_args=load_checkpoint_cfg.load_optimizer_args,
         )
+        resume_lr_scheduler(self._lr_scheduler, resume_from, load_scheduler=load_checkpoint_cfg.load_scheduler)
 
         for name, worker in self._attached.items():
             resume_fn = getattr(worker, "resume", None)
@@ -1795,6 +1796,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                     role_path,
                     load_optimizer_states=load_checkpoint_cfg.load_optimizer_states,
                     load_optimizer_args=load_checkpoint_cfg.load_optimizer_args,
+                    load_scheduler=load_checkpoint_cfg.load_scheduler,
                 )
 
         # Resume sft dataloader
