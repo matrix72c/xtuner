@@ -19,7 +19,9 @@ from .rollout_topology import RolloutTopology
 from .utils import SessionRouter
 from .worker import (
     ROLLOUT_CONCURRENCY_GROUP_GENERATE,
+    SERVING_METRICS_GATHER_TIMEOUT_S,
     RolloutConfig,
+    aggregate_serving_metrics,
     get_rollout_worker_base_cls,
 )
 from .worker_registry import RolloutWorkerRegistry, WorkerLifecycleState
@@ -120,6 +122,30 @@ class RolloutController:
             worker.session_url for worker in self.registry.active_entrypoints() if worker.session_url is not None
         )
         self.proxy_manager.replace_registered_session_urls(session_urls)
+
+    def collect_server_metrics(self) -> dict[str, float]:
+        """Aggregate serving metrics scraped from every active request entrypoint.
+
+        Fail-open by design: with no active entrypoint, or when the remote scrape
+        fails (e.g. servers offloaded during weight sync), an empty dict is
+        returned so training never depends on the metrics path.
+
+        Returns:
+            dict[str, float]: Gauge averages across entrypoints and summed
+            counters/histogram sums/counts; empty on failure.
+        """
+        entrypoints = self.registry.active_entrypoints()
+        if not entrypoints:
+            return {}
+        try:
+            per_endpoint = ray.get(
+                [worker.actor.scrape_metrics.remote() for worker in entrypoints],  # type: ignore[attr-defined]
+                timeout=SERVING_METRICS_GATHER_TIMEOUT_S,
+            )
+        except Exception:
+            self.logger.exception("Collecting serving metrics from rollout workers failed.")
+            return {}
+        return aggregate_serving_metrics([metrics or {} for metrics in per_endpoint])
 
     def validate_registered_workers_to_proxy(self) -> None:
         if self.proxy_manager is None:
