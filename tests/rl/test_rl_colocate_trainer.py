@@ -107,6 +107,8 @@ def _build_fake_agent_loop():
     agent_loop.resume = AsyncMock()
     agent_loop.close = AsyncMock()
     agent_loop.rollout_ctl = rollout_ctl
+    # collect_metrics 遵循 drain 契约；替身实现返回空窗口。
+    agent_loop.collect_metrics.remote = AsyncMock(return_value={})
 
     async def generate_group(rollout_states, **kwargs):
         model_step = kwargs.get("model_step", kwargs.get("train_step", 0))
