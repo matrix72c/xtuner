@@ -41,7 +41,7 @@ from xtuner.v1.rl.replay_buffer import (
 )
 from xtuner.v1.rl.rollout.controller import RolloutControllerProxy
 from xtuner.v1.rl.rollout.trace_store import release_and_discard_rollout_groups
-from xtuner.v1.rl.rollout.worker import RolloutConfig
+from xtuner.v1.rl.rollout.worker import SERVING_GAUGE_KEYS, SERVING_METRICS_GATHER_TIMEOUT_S, RolloutConfig
 from xtuner.v1.rl.rollout.worker_registry import WorkerLifecycleState
 from xtuner.v1.rl.trace import TraceConfig, close_trace, configure_trace
 from xtuner.v1.rl.trainer.controller import TrainingController
@@ -555,6 +555,9 @@ class BaseRLTrainer:
     _debug_train_files: dict[int, Path]
     _distillation: DistillationTrainerAdapter
     _distillation_config: DistillationConfig | None
+    # Serving-metrics baseline for per-step deltas; class-level default so fakes that
+    # bypass __init__ still read ``None`` instead of raising.
+    _last_serving_metrics: dict[str, float] | None = None
 
     def _init_common(self, cfg: BaseRLTrainerConfig, *, meta_path: str, logger_tag: str) -> None:
         distillation_config = cfg.distillation_config
@@ -1134,6 +1137,72 @@ class BaseRLTrainer:
             rollout_tgs=rollout_tokens_per_s / rollout_gpu_count,
         )
 
+    def _collect_serving_metrics(self) -> dict[str, float]:
+        """Scrape serving metrics from the rollout controller actor, fail-open.
+
+        Returns:
+            dict[str, float]: Aggregated serving metrics; empty when the
+            controller is unavailable or the scrape fails, so a metrics outage
+            never interrupts training.
+        """
+        try:
+            result = ray.get(
+                self.rollout_controller.collect_server_metrics.remote(),  # type: ignore[attr-defined]
+                timeout=SERVING_METRICS_GATHER_TIMEOUT_S,
+            )
+            return result or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _serving_step_values(
+        previous: dict[str, float] | None,
+        current: dict[str, float],
+    ) -> dict[str, float]:
+        """Derive per-step serving values from two consecutive scrapes.
+
+        Gauges pass through unchanged; counters and histogram sums/counts become
+        deltas between the scrapes, clamped at zero against endpoint restarts.
+        The first scrape has no previous value and yields zero deltas. Histogram
+        means are the sum delta over the count delta.
+
+        Args:
+            previous (dict[str, float] | None): The previous scrape; ``None`` on
+                the first logged step.
+            current (dict[str, float]): The current scrape.
+
+        Returns:
+            dict[str, float]: Per-step serving values without the ``serving/``
+            prefix. Raw histogram sum/count deltas are dropped in favor of the
+            derived means.
+        """
+        values: dict[str, float] = {}
+        for key, value in current.items():
+            if key in SERVING_GAUGE_KEYS:
+                values[key] = value
+            elif previous is not None and key in previous:
+                values[key] = max(value - previous[key], 0.0)
+            else:
+                values[key] = 0.0
+        for mean_key, (sum_key, count_key) in {
+            "ttft_mean": ("ttft_sum", "ttft_count"),
+            "tpot_mean": ("tpot_sum", "tpot_count"),
+            "e2e_mean": ("e2e_sum", "e2e_count"),
+        }.items():
+            count = values.get(count_key, 0.0)
+            if count > 0:
+                values[mean_key] = values.get(sum_key, 0.0) / count
+            else:
+                values[mean_key] = 0.0
+        for sum_key, count_key in (
+            ("ttft_sum", "ttft_count"),
+            ("tpot_sum", "tpot_count"),
+            ("e2e_sum", "e2e_count"),
+        ):
+            values.pop(sum_key, None)
+            values.pop(count_key, None)
+        return values
+
     def _log_step(
         self,
         train_step: int,
@@ -1169,6 +1238,12 @@ class BaseRLTrainer:
         if produce_result.custom_scalars:
             for key, value in derive_window_means(produce_result.custom_scalars).items():
                 all_scalars[f"agent/{key}"] = value
+
+        current_serving_metrics = self._collect_serving_metrics()
+        serving_step_values = self._serving_step_values(self._last_serving_metrics, current_serving_metrics)
+        self._last_serving_metrics = current_serving_metrics or None
+        if serving_step_values:
+            all_scalars.update({f"serving/{key}": value for key, value in serving_step_values.items()})
 
         if train_info:
             data_info = train_info.get("data_info", {})
