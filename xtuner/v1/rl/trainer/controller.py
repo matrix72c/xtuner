@@ -105,6 +105,49 @@ def _state_has_routed_experts(state: RolloutState) -> bool:
     return bool(flag)
 
 
+def _session_value_stats(
+    values: list[list[float]],
+    returns: list[list[float]],
+    masks: list[list[bool]],
+) -> dict[str, float] | None:
+    """Critic value-vs-return health statistics for session GAE.
+
+    With gamma=lambda=1 the per-token return equals the session's terminal
+    reward, so ``critic/explained_variance`` reads as how well the critic
+    predicts episode outcomes: 1.0 is a perfect prediction, 0.0 is no better
+    than the constant mean, and negative values are worse than the mean.
+
+    Args:
+        values (list[list[float]]): Per-sample critic values, one entry per shifted token.
+        returns (list[list[float]]): Per-sample returns with the same layout.
+        masks (list[list[bool]]): Per-sample supervised-token masks (shifted label != -100).
+
+    Returns:
+        dict[str, float] | None: ``critic/``-prefixed mean/std/explained-variance
+        scalars over supervised tokens, or ``None`` when there is none.
+    """
+    flat_values: list[float] = []
+    flat_returns: list[float] = []
+    for sample_values, sample_returns, mask in zip(values, returns, masks):
+        for value, return_value, keep in zip(sample_values, sample_returns, mask):
+            if keep:
+                flat_values.append(float(value))
+                flat_returns.append(float(return_value))
+    if not flat_values:
+        return None
+    value_tensor = torch.tensor(flat_values, dtype=torch.float64)
+    return_tensor = torch.tensor(flat_returns, dtype=torch.float64)
+    return_var = return_tensor.var(correction=0).item()
+    residual_var = (return_tensor - value_tensor).var(correction=0).item()
+    return {
+        "critic/value_mean": value_tensor.mean().item(),
+        "critic/value_std": value_tensor.std(correction=0).item(),
+        "critic/return_mean": return_tensor.mean().item(),
+        "critic/return_std": return_tensor.std(correction=0).item(),
+        "critic/explained_variance": 1.0 - residual_var / return_var if return_var > 0 else 0.0,
+    }
+
+
 class TrainingController:
     def __init__(
         self,
@@ -185,21 +228,45 @@ class TrainingController:
 
     @staticmethod
     def _critic_log_scalars(critic_logs: list[WorkerLogItem] | None) -> dict[str, float]:
-        """Average rank-0 critic step metrics into ``data_info`` keys."""
+        """Average rank-0 critic step metrics into ``data_info`` keys.
+
+        Value-clip counters are summed across critic mini-steps and the clip
+        fraction is re-derived from those sums: averaging per-step fractions
+        would mis-weight optimizer steps covering different token counts.
+        """
         if not critic_logs:
             return {}
         steps = critic_logs[0].get("train_metrics") or []
+        mean_rename = {"reduced_llm_loss": "critic/value_loss", "grad_norm": "critic/grad_norm"}
+        sum_rename = {
+            "reduced_critic_value_clip_count": "critic/value_clip_count",
+            "reduced_critic_value_valid_count": "critic/value_valid_count",
+        }
         sums: dict[str, float] = {}
         counts: dict[str, int] = {}
-        rename = {"reduced_llm_loss": "critic/value_loss", "grad_norm": "critic/grad_norm"}
         for step in steps:
             for key, value in step.items():
-                target = rename.get(key)
-                if target is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
                     continue
-                sums[target] = sums.get(target, 0.0) + float(value)
-                counts[target] = counts.get(target, 0) + 1
-        return {key: sums[key] / counts[key] for key in sums}
+                target = mean_rename.get(key)
+                if target is not None:
+                    sums[target] = sums.get(target, 0.0) + float(value)
+                    counts[target] = counts.get(target, 0) + 1
+                    continue
+                target = sum_rename.get(key)
+                if target is not None:
+                    sums[target] = sums.get(target, 0.0) + float(value)
+        scalars: dict[str, float] = {}
+        for target, total in sums.items():
+            if target in counts:
+                scalars[target] = total / counts[target]
+            else:
+                scalars[target] = total
+        clip_count = scalars.get("critic/value_clip_count")
+        valid_count = scalars.get("critic/value_valid_count")
+        if clip_count is not None and valid_count is not None:
+            scalars["critic/value_clip_frac"] = clip_count / valid_count if valid_count > 0 else 0.0
+        return scalars
 
     def _build_trainer_log_info(
         self,
@@ -446,7 +513,13 @@ class TrainingController:
         pack_plan: _PackPlan,
         value_batches: list[TokenBatchProto] | None,
         data_replicate_size: int,
-    ) -> tuple[list[float], list[list[float]] | None, list[list[float]] | None, dict[str, float] | None]:
+    ) -> tuple[
+        list[float],
+        list[list[float]] | None,
+        list[list[float]] | None,
+        dict[str, float] | None,
+        dict[str, float] | None,
+    ]:
         """Estimate advantages with the configured mode and return the stats.
 
         Args:
@@ -469,6 +542,9 @@ class TrainingController:
             advantage_stats (dict[str, float] | None): ``mean``/``min``/``max`` of the
                 supervised-token advantages. ``None`` for the non-GAE and session-GAE paths,
                 whose stats are derived downstream from the returned advantages.
+            value_stats (dict[str, float] | None): ``critic/``-prefixed value-vs-return
+                health metrics from :func:`_session_value_stats`. ``None`` unless
+                session GAE.
         """
         if self._gae_reward_scope is None:
             # Group-based scalar advantages (GRPO-style, no critic): one advantage per
@@ -480,7 +556,7 @@ class TrainingController:
                         group["rewards"], group["representatives"], group["cluster_indices"]
                     )
                 )
-            return sample_advantages, None, None, None
+            return sample_advantages, None, None, None, None
         elif self._gae_reward_scope == "segment":
             # Segment GAE stays worker-local: values were cached by ``collect_values`` and
             # each worker computes per-segment targets in place. Only replica-0 workers
@@ -503,7 +579,7 @@ class TrainingController:
                 "min": min((result["min"] for result in gae_results), default=0.0),
                 "max": max((result["max"] for result in gae_results), default=0.0),
             }
-            return [], None, None, advantage_stats
+            return [], None, None, advantage_stats, None
         elif self._gae_reward_scope == "session":
             # Session GAE groups tokens across samples of one session, so critic values must
             # be gathered on the controller. Scatter each rank's local values back to global
@@ -532,14 +608,21 @@ class TrainingController:
             )
             # Sample-level log values: the mean of each sample's supervised-token advantages.
             sample_means: list[float] = []
+            supervised_masks: list[list[bool]] = []
             for state, row in zip(rollout_items, token_advantages):
                 labels = state.labels or []
                 mask = [label != -100 for label in labels[1:]]
                 if len(mask) != len(row):
                     raise ValueError(f"shifted label length {len(mask)} does not match advantage length {len(row)}")
+                supervised_masks.append(mask)
                 supervised = [advantage for advantage, keep in zip(row, mask) if keep]
                 sample_means.append(sum(supervised) / len(supervised) if supervised else 0.0)
-            return sample_means, token_advantages, token_returns, None
+            value_stats = _session_value_stats(
+                cast(list[list[float]], dense_values),
+                token_returns,
+                supervised_masks,
+            )
+            return sample_means, token_advantages, token_returns, None, value_stats
         else:
             raise ValueError(f"Unknown GAE reward scope: {self._gae_reward_scope}")
 
@@ -576,6 +659,7 @@ class TrainingController:
         token_advantages: list[list[float]] | None = None
         token_returns: list[list[float]] | None = None
         advantage_stats: dict[str, float] | None = None
+        value_stats: dict[str, float] | None = None
         segment_gae = self._gae_reward_scope == "segment"
         try:
             # Nested in a list so Ray does not dereference it before the worker
@@ -615,12 +699,14 @@ class TrainingController:
                     value_batches = ray.get(value_handles, timeout=TRAIN_RAY_GET_TIMEOUT)
             # 2.5. Estimate advantages with the configured mode: group scalars without a
             # critic, worker-local segment GAE, or controller-side session GAE.
-            sample_advantages, token_advantages, token_returns, advantage_stats = self._estimate_advantages(
-                prepared,
-                rollout_items,
-                pack_plan,
-                cast(list[TokenBatchProto], value_batches) if value_batches is not None else None,
-                data_replicate_size,
+            sample_advantages, token_advantages, token_returns, advantage_stats, value_stats = (
+                self._estimate_advantages(
+                    prepared,
+                    rollout_items,
+                    pack_plan,
+                    cast(list[TokenBatchProto], value_batches) if value_batches is not None else None,
+                    data_replicate_size,
+                )
             )
             # 3. Optional. Critic fit. Each worker trains the value head on its samples' token returns.
             if has_critic:
@@ -705,6 +791,7 @@ class TrainingController:
             raw_rewards_count=raw_rewards_count,
         )
         data_info.update(self._critic_log_scalars(critic_log_infos))
+        data_info.update(value_stats or {})
         data_info.update({f"time/{name}": value for name, value in timers.items()})
         return log_infos, data_info
 

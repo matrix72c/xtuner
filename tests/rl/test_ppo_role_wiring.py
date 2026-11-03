@@ -471,8 +471,10 @@ class TestSessionGAEDispatch(unittest.TestCase):
             decoy,
         ]
 
-        sample_means, token_advantages, token_returns, advantage_stats = self._controller()._estimate_advantages(
-            {"reward_groups": []}, rollout_items, pack_plan, value_batches, data_replicate_size=2
+        sample_means, token_advantages, token_returns, advantage_stats, value_stats = (
+            self._controller()._estimate_advantages(
+                {"reward_groups": []}, rollout_items, pack_plan, value_batches, data_replicate_size=2
+            )
         )
 
         # Token rows keep each sample's shifted-label length.
@@ -491,6 +493,18 @@ class TestSessionGAEDispatch(unittest.TestCase):
             self.assertAlmostEqual(mean, sum(supervised) / len(supervised))
         # Session-GAE stats are derived downstream, not here.
         self.assertIsNone(advantage_stats)
+        # Session GAE reports critic value-vs-return health stats.
+        self.assertIsNotNone(value_stats)
+        self.assertEqual(
+            sorted(value_stats),
+            [
+                "critic/explained_variance",
+                "critic/return_mean",
+                "critic/return_std",
+                "critic/value_mean",
+                "critic/value_std",
+            ],
+        )
 
     def test_session_gae_rejects_value_count_mismatch(self):
         # 行为：values 行数与样本数不匹配时拒绝

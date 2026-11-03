@@ -420,7 +420,7 @@ class TestPrepareRolloutItems(unittest.TestCase):
     def _prepare(self, controller, data_groups):
         prepared = controller._prepare_rollout_items(data_groups, rollout_idx=0)
         plan = {"dp_plans": {}, "plan_log": {}}
-        advantages, _, _, _ = controller._estimate_advantages(prepared, prepared["rollout_items"], plan, None, 1)
+        advantages, _, _, _, _ = controller._estimate_advantages(prepared, prepared["rollout_items"], plan, None, 1)
         return (
             prepared["rollout_items"],
             advantages,
@@ -497,7 +497,9 @@ class TestPrepareRolloutItems(unittest.TestCase):
         self.assertEqual(controller.advantage_estimator.calls, [])
         self.assertNotIn("advantages", prepared)
         self.assertEqual(
-            controller._estimate_advantages(prepared, prepared["rollout_items"], {"dp_plans": {}, "plan_log": {}}, None, 1)[0],
+            controller._estimate_advantages(
+                prepared, prepared["rollout_items"], {"dp_plans": {}, "plan_log": {}}, None, 1
+            )[0],
             [1.0],
         )
         self.assertEqual(len(controller.advantage_estimator.calls), 1)
