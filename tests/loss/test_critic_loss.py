@@ -7,6 +7,13 @@
 - TestCriticLossSP
     - test_sp_value_loss_parity: SP 分片与 SP=1 参照的 loss / head 梯度 / hidden 梯度对齐
       (奇数长度、跨样本 ignore、空 rank、多 microbatch 共用全局分母,MSE / clipped 两分支)
+- TestCriticValueClipCounts
+    - 逐 token clip/valid 计数、严格 cliprange 边界与 ignore_idx 掩码。
+    - 空 rank 在 old_values 存在时仍发零计数，保持 finalize all-reduce 的 rank 对称。
+- TestFinalizeCriticValueMetrics
+    - 无 dist 环境下的派生与 config 委托。
+- TestExtraLogInfoWhitelistRoundTrip
+    - 新计数 key 跨 micro-batch 求和保留。
 """
 
 import os
@@ -324,9 +331,17 @@ class TestCriticValueClipCounts(unittest.TestCase):
         extra_info = _loss_fn_with_values(values=[0.5, 0.1], old_values=None, labels=[5, 6])
         self.assertEqual(extra_info, {})
 
-    def test_all_ignored_tokens_emit_no_counters(self):
-        # 行为：全 ignore 的空 rank 不产生计数，loss 退化为 0
+    def test_all_ignored_tokens_still_emit_zero_counters(self):
+        # 回归：全 ignore 的空 rank（old_values 存在）也必须发出计数 key（值为 0）。
+        # 若缺失，finalize 的 all-reduce 会按 rank 条件跳过，有 token 的 rank 在
+        # NCCL 上永久等待直至 watchdog 击杀 worker（smoke 两连挂的根因）。
         extra_info = _loss_fn_with_values(values=[0.5], old_values=[0.0], labels=[-100])
+        self.assertEqual(extra_info["reduced_critic_value_clip_count"].item(), 0.0)
+        self.assertEqual(extra_info["reduced_critic_value_valid_count"].item(), 0.0)
+
+    def test_mse_path_all_ignored_emits_no_counters(self):
+        # 行为：old_values 缺失（SFT MSE 路径）且全 ignore 时不产生计数
+        extra_info = _loss_fn_with_values(values=[0.5], old_values=None, labels=[-100])
         self.assertEqual(extra_info, {})
 
 
