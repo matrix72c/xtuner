@@ -3,6 +3,7 @@
 Good Tests:
 - 用手工张量精确控制 old_values 与 values 的偏差，断言 clip/valid 计数的逐 token 结果。
 - 覆盖 cliprange 边界（严格大于才算 clipped）与 ignore_idx 掩码。
+- 空 rank（全 ignore）在 old_values 存在时仍发零计数：finalize 的 all-reduce 必须保持 rank 对称。
 - finalize 无 dist 环境下的派生与 config 委托。
 - ModelForwardExtraLogInfo 白名单 round-trip：新计数 key 能被求和保留。
 
@@ -65,9 +66,17 @@ class TestCriticValueClipCounts(unittest.TestCase):
         extra_info = _loss_fn_with_values(values=[0.5, 0.1], old_values=None, labels=[5, 6])
         self.assertEqual(extra_info, {})
 
-    def test_all_ignored_tokens_emit_no_counters(self):
-        # 行为：全 ignore 的空 rank 不产生计数，loss 退化为 0
+    def test_all_ignored_tokens_still_emit_zero_counters(self):
+        # 回归：全 ignore 的空 rank（old_values 存在）也必须发出计数 key（值为 0）。
+        # 若缺失，finalize 的 all-reduce 会按 rank 条件跳过，有 token 的 rank 在
+        # NCCL 上永久等待直至 watchdog 击杀 worker（smoke 两连挂的根因）。
         extra_info = _loss_fn_with_values(values=[0.5], old_values=[0.0], labels=[-100])
+        self.assertEqual(extra_info["reduced_critic_value_clip_count"].item(), 0.0)
+        self.assertEqual(extra_info["reduced_critic_value_valid_count"].item(), 0.0)
+
+    def test_mse_path_all_ignored_emits_no_counters(self):
+        # 行为：old_values 缺失（SFT MSE 路径）且全 ignore 时不产生计数
+        extra_info = _loss_fn_with_values(values=[0.5], old_values=None, labels=[-100])
         self.assertEqual(extra_info, {})
 
 

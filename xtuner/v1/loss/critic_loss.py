@@ -197,16 +197,22 @@ class CriticLossContext(BaseLossContext):
         valid_mask = shifted_labels != self.loss_cfg.ignore_idx
         rank_grad_tokens = valid_mask.sum()
         extra_info: dict[str, Any] = {}
-        if rank_grad_tokens == 0:
-            loss = values.sum() * 0
-        elif old_values is None:
-            per_token = 0.5 * (values_squeezed - returns) ** 2
-            loss = (per_token * loss_weight).sum()
+        if old_values is None:
+            if rank_grad_tokens == 0:
+                loss = values.sum() * 0
+            else:
+                per_token = 0.5 * (values_squeezed - returns) ** 2
+                loss = (per_token * loss_weight).sum()
         else:
             cliprange = self.loss_cfg.cliprange_value
             v_clip = old_values + (values_squeezed - old_values).clamp(-cliprange, cliprange)
             per_token = 0.5 * torch.maximum((values_squeezed - returns) ** 2, (v_clip - returns) ** 2)
             loss = (per_token * loss_weight).sum()
+            # Emit the counters on every rank whenever old_values is present, including
+            # fully-masked ranks whose counts are zero: a missing key would make
+            # ``finalize_critic_value_metrics`` skip its all-reduce rank-conditionally
+            # and deadlock NCCL against ranks that do reduce (the pack builder avoids
+            # the same class of bug by zero-filling old_values for missing packs).
             # Match the clip condition used by ``clamp`` exactly: equality keeps the
             # unclipped value, so only a strict deviation beyond the range counts.
             clipped = (values_squeezed - old_values).abs() > cliprange
@@ -237,6 +243,12 @@ def finalize_critic_value_metrics(extra_info_dict: dict[str, Any], device: str |
     micro-batch reduction, all-reduces them into global counts, and derives
     ``reduced_critic_value_clip_frac``. Dictionaries without the critic keys
     (e.g. the unclipped SFT-MSE path) pass through unchanged.
+
+    The all-reduce below must stay rank-symmetric: within one fit round either
+    every rank carries the keys (``loss_fn`` emits them whenever ``old_values``
+    is present, zero-filled on fully-masked ranks) or none does. A rank that
+    skips it while peers reduce deadlocks NCCL until the watchdog kills the
+    worker.
 
     Args:
         extra_info_dict (dict[str, Any]): Metric dict after micro-batch reduction.
