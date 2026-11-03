@@ -6,11 +6,17 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeAlias, cast, overload
 
 import ray
+import torch
 from pydantic import BaseModel, ConfigDict
 from ray.actor import ActorClass, ActorProxy
 from ray.util.placement_group import PlacementGroup
 
-from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status, get_group_status
+from xtuner.v1.data_proto.rl_data import (
+    RolloutState,
+    SampleParams,
+    Status,
+    get_group_status,
+)
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.rollout.constants import AGENT_LOOP_RAY_GENERATE_MAX_CONCURRENCY
@@ -280,7 +286,90 @@ class AgentLoop(ABC):
                 group = await self.run_judger(group)
 
         group = maybe_filter_invalid_sample(group, self.is_valid_sample_fn, self.logger)
-        return await self._teacher_scorer.on_group_ready(group)
+        group = await self._teacher_scorer.on_group_ready(group)
+        return self.canonicalize_train_fields(group)
+
+    def _write_train_meta(self, rollout_state: RolloutState) -> None:
+        """Write the controller-facing lightweight train metadata in place.
+
+        Agent loops call this once the canonical training fields (``input_ids``/``labels``/
+        ``logprobs``) are finalized, so downstream scheduling only consumes scalar statistics
+        instead of token-level fields. Samples that are not ``COMPLETED`` or that lack aligned
+        ``input_ids``/``labels`` are left untouched; the function is idempotent.
+
+        Args:
+            rollout_state (RolloutState): Rollout state updated in place: ``num_tokens``
+                becomes the shifted training length (``len(input_ids) - 1``) and
+                ``extra_fields`` gains ``train_prompt_length``, ``train_response_length``,
+                ``supervised_tokens``, ``position_layout``, ``has_rollout_logprobs`` and
+                ``has_routed_experts``.
+        """
+        if rollout_state.status != Status.COMPLETED:
+            return
+        input_ids = rollout_state.input_ids
+        labels = rollout_state.labels
+        if input_ids is None or labels is None or len(input_ids) != len(labels) or len(input_ids) < 2:
+            return
+        shifted_labels = labels[1:]
+        supervised_tokens = sum(1 for label in shifted_labels if label != -100)
+        # prompt_len 统计原始输入 prompt 长度（VLM 的 prompt 在 train_prompt_ids）；prompt_ids
+        # 缺失时退回 shifted_labels 的非监督位计数，与 controller 既有 data_info 口径一致。
+        prompt_ids = rollout_state.extra_fields.get("train_prompt_ids") or rollout_state.prompt_ids
+        prompt_length = len(prompt_ids) if prompt_ids else len(shifted_labels) - supervised_tokens
+        position_ids = rollout_state.position_ids
+        rollout_state.num_tokens = len(input_ids) - 1
+        rollout_state.extra_fields["train_prompt_length"] = prompt_length
+        rollout_state.extra_fields["train_response_length"] = len(rollout_state.response_ids or [])
+        rollout_state.extra_fields["supervised_tokens"] = supervised_tokens
+        rollout_state.extra_fields["position_layout"] = (
+            "mrope_3d" if position_ids is not None and position_ids.ndim == 3 else "1d"
+        )
+        # 批级 presence 标志：controller 只读布尔位即可判定 pack 模板（rollout logprobs 的
+        # IS 指标 collective、routed experts dummy 填充），不需要触碰 token 级字段。
+        rollout_state.extra_fields["has_rollout_logprobs"] = rollout_state.logprobs is not None
+        rollout_state.extra_fields["has_routed_experts"] = rollout_state.routed_experts is not None
+
+    def canonicalize_train_fields(self, group: list[RolloutState]) -> list[RolloutState]:
+        """Build full, unshifted training fields and write lightweight
+        metadata.
+
+        Already assembled sequences are preserved. A construction error marks that sample failed so the producer can
+        discard its group without aborting the produce window.
+        """
+        for state in group:
+            if state.status != Status.COMPLETED:
+                continue
+            try:
+                if state.input_ids is None:
+                    prompt_ids = state.extra_fields.get("train_prompt_ids", state.prompt_ids)
+                    assert prompt_ids is not None and len(prompt_ids) > 0, (
+                        f"Prompt ids cannot be None or empty in data: {state}"
+                    )
+                    if state.response_ids is not None:
+                        response_ids = (
+                            state.response_ids.flatten().tolist()
+                            if isinstance(state.response_ids, torch.Tensor)
+                            else list(state.response_ids)
+                        )
+                    else:
+                        assert state.response is not None, "response item cannot be None"
+                        response_ids = (
+                            self.tokenizer(state.response, return_tensors="pt")["input_ids"].flatten().tolist()
+                        )
+                    state.response_ids = response_ids
+                    if state.logprobs is not None:
+                        assert len(state.logprobs) == len(response_ids), (
+                            f"{len(state.logprobs)} vs {len(response_ids)}, data: {state}"
+                        )
+                        state.logprobs = [0.0] * len(prompt_ids) + list(state.logprobs)
+                    state.input_ids = list(prompt_ids) + response_ids
+                    state.labels = [-100] * len(prompt_ids) + response_ids
+                self._write_train_meta(state)
+            except Exception as exc:
+                self.logger.error(f"Canonicalize failed for rollout_id={state.rollout_id}: {exc}")
+                state.status = Status.FAILED
+                state.error_msg = f"canonicalize_train_fields failed: {exc}"
+        return group
 
     @overload
     async def run_judger(self, rollout_state: RolloutState) -> RolloutState: ...
