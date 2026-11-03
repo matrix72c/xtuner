@@ -91,7 +91,7 @@ class CriticWorker(RoleWorker):
         self._num_passes = worker_cfg.num_passes
         self._optimizer_steps_per_pass = worker_cfg.optimizer_steps_per_pass
         self.lr_scheduler = build_lr_scheduler(self.engine.optimizer, worker_cfg.lr_cfg, worker_cfg.scheduler_steps)
-        self.loss_cfg = None  # CriticLossConfig has no finalize_metrics
+        self.loss_cfg = worker_cfg.loss_cfg
 
     def _resolve_refs(self, seq_ctx: SequenceContext) -> None:
         """Multimodal refs only: the critic routes experts on its own, so
