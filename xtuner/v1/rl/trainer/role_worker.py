@@ -307,6 +307,11 @@ class RoleWorker(ABC):
 
     def save_hf(self, hf_dir: Path, save_dtype: torch.dtype) -> None:
         """Save the role model in Hugging Face format under ``hf_dir``."""
+        # HF shard reconstruction all-gathers params over the training process groups, which are
+        # NCCL-only. A role left on CPU after its fit (e.g. the PPO critic, offloaded while the
+        # actor trains) would feed CPU tensors into the gather and crash, so move the model back
+        # to the training device first. The next role switch re-establishes the usual placement.
+        self.onload_model()
         self.engine.save_hf(hf_dir=hf_dir, save_dtype=save_dtype)
 
     def _cached(self) -> tuple[list[TrainSample], DPRankPackIndices, TrainBatchAttr]:
