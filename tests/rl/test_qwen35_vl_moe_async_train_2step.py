@@ -168,7 +168,9 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
             "steps": step_metrics,
             "produce_calls": self.produce_calls,
         }
-        print("qwen35 vl moe async train 2-step diagnostics:\n" + json.dumps(diagnostics, ensure_ascii=False, indent=2))
+        print(
+            "qwen35 vl moe async train 2-step diagnostics:\n" + json.dumps(diagnostics, ensure_ascii=False, indent=2)
+        )
 
     def build_config(self, work_dir: Path) -> RLColocateTrainerConfig:
         resources = AcceleratorResourcesConfig(
@@ -423,9 +425,7 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
         self.assertEqual([call["model_step"] for call in self.produce_calls], [0, 1])
 
     def _assert_ep_gather_skipped(self, trainer) -> None:
-        gather_counts = ray.get(
-            [worker.get_ep_gather_count.remote() for worker in trainer.train_controller.workers]
-        )
+        gather_counts = ray.get([worker.get_ep_gather_count.remote() for worker in trainer.train_controller.workers])
         self.assertEqual(
             sum(gather_counts),
             0,
@@ -442,7 +442,10 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
                     self.assertIn("image_data", sample.extra_fields)
                     self.assertTrue(sample.response_ids)
                     self.assertIsNotNone(sample.logprobs)
-                    self.assertEqual(len(sample.logprobs), len(sample.response_ids))
+                    # canonicalize 后 input_ids/labels/logprobs 全序列对齐（prompt 前缀补 0）。
+                    expected_total_len = len(sample.extra_fields["train_prompt_ids"]) + len(sample.response_ids)
+                    self.assertEqual(len(sample.input_ids), expected_total_len)
+                    self.assertEqual(len(sample.logprobs), len(sample.input_ids))
                     self.assertIsNotNone(sample.reward)
                     self.assertIn("score", sample.reward)
 
@@ -466,7 +469,9 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
                 response_lens.append(int(row["response_len"]))
                 finish_reasons.append(row.get("finish_reason"))
 
-        self.assertGreater(max(response_lens), min(response_lens), "expected response length diversity across rollout artifacts")
+        self.assertGreater(
+            max(response_lens), min(response_lens), "expected response length diversity across rollout artifacts"
+        )
         self.assertIn("stop", finish_reasons, "expected at least one rollout sample to stop before max_tokens")
 
     def _load_trajectory_objects(self, path: Path) -> list[dict[str, Any]]:
