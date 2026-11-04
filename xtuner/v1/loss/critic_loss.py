@@ -52,7 +52,8 @@ class CriticLossConfig(BaseLossConfig):
         return CriticLossKwargs
 
     def finalize_metrics(self, extra_info_dict: dict[str, Any], device: str | torch.device) -> dict[str, Any]:
-        """Finalize value-clip metrics emitted by :meth:`CriticLossContext.loss_fn`.
+        """Finalize value-clip metrics emitted by
+        :meth:`CriticLossContext.loss_fn`.
 
         Args:
             extra_info_dict (dict[str, Any]): Per-rank metric dict after micro-batch reduction.
