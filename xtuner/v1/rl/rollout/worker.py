@@ -122,7 +122,8 @@ _SERVING_HISTOGRAM_SAMPLES = {
 
 
 def parse_serving_metrics(text: str) -> dict[str, float]:
-    """Parse allowlisted LMDeploy ``/metrics`` exposition text into flat scalars.
+    """Parse allowlisted LMDeploy ``/metrics`` exposition text into flat
+    scalars.
 
     Only allowlisted samples are kept; the default python/process collectors are
     ignored. Gauges are averaged across labeled samples (multiple engines behind
@@ -981,7 +982,8 @@ class RolloutWorker(SingleAcceleratorWorker):
             return False
 
     def scrape_metrics(self) -> dict[str, float]:
-        """Scrape allowlisted serving metrics from this worker's inference server.
+        """Scrape allowlisted serving metrics from this worker's inference
+        server.
 
         Fail-open by design: the server may be sleeping or offloaded during
         weight sync, so any failure logs a rate-limited warning and returns an
