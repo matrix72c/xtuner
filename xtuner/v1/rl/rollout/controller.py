@@ -21,10 +21,9 @@ from .worker import (
     ROLLOUT_CONCURRENCY_GROUP_GENERATE,
     SERVING_METRICS_GATHER_TIMEOUT_S,
     RolloutConfig,
-    aggregate_serving_metrics,
     get_rollout_worker_base_cls,
 )
-from .worker_registry import RolloutWorkerRegistry, WorkerLifecycleState
+from .worker_registry import RolloutWorkerRegistry, WorkerLifecycleState, WorkerSnapshot
 
 
 # Keep this as a Ray actor because Ray AgentLoop actors need a shared, cross-process handle to the same controller
@@ -123,29 +122,33 @@ class RolloutController:
         )
         self.proxy_manager.replace_registered_session_urls(session_urls)
 
-    def collect_server_metrics(self) -> dict[str, float]:
-        """Aggregate serving metrics scraped from every active request entrypoint.
-
-        Fail-open by design: with no active entrypoint, or when the remote scrape
-        fails (e.g. servers offloaded during weight sync), an empty dict is
-        returned so training never depends on the metrics path.
+    async def collect_server_metrics(self) -> dict[str, dict[str, float]]:
+        """Scrape request entrypoints without discarding endpoint identity.
 
         Returns:
-            dict[str, float]: Gauge averages across entrypoints and summed
-            counters/histogram sums/counts; empty on failure.
+            dict[str, dict[str, float]]: Cumulative metrics keyed by server URL.
+                Failed or inactive registered endpoints have empty values so
+                consumers retain their baselines. Only removed endpoints are absent.
         """
-        entrypoints = self.registry.active_entrypoints()
-        if not entrypoints:
-            return {}
-        try:
-            per_endpoint = ray.get(
-                [worker.actor.scrape_metrics.remote() for worker in entrypoints],  # type: ignore[attr-defined]
-                timeout=SERVING_METRICS_GATHER_TIMEOUT_S,
-            )
-        except Exception:
-            self.logger.exception("Collecting serving metrics from rollout workers failed.")
-            return {}
-        return aggregate_serving_metrics([metrics or {} for metrics in per_endpoint])
+        entrypoints = [worker for worker in self.registry.all_workers() if worker.is_request_entrypoint]
+
+        async def scrape(worker: WorkerSnapshot) -> dict[str, float]:
+            if not worker.is_active():
+                return {}
+            try:
+                return (
+                    await asyncio.wait_for(
+                        worker.actor.scrape_metrics.remote(),  # type: ignore[attr-defined]
+                        timeout=SERVING_METRICS_GATHER_TIMEOUT_S,
+                    )
+                    or {}
+                )
+            except Exception:
+                self.logger.exception("Collecting serving metrics from %s failed.", worker.url)
+                return {}
+
+        per_endpoint = await asyncio.gather(*(scrape(worker) for worker in entrypoints))
+        return {worker.url: metrics for worker, metrics in zip(entrypoints, per_endpoint)}
 
     def validate_registered_workers_to_proxy(self) -> None:
         if self.proxy_manager is None:

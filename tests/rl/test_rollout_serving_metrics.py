@@ -3,19 +3,21 @@
 Good Tests:
 - 用 pin 版 lmdeploy 实际生成的 /metrics 文本锁定 parse_serving_metrics 的白名单行为。
 - aggregate_serving_metrics 的 gauge 均值 / 计数求和，以及失败端点（空 dict）不稀释 gauge。
-- ``_serving_step_values`` 的首步零、增量、counter reset clamp、直方图均值派生。
-- worker scrape 与 controller collect 的 fail-open 行为（不打断训练）。
+- 按端点差分、抓取失败保留 baseline、恢复跨窗口标记、counter reset 和加权直方图均值。
+- worker scrape 与异步 controller collect 的 fail-open 行为（不阻塞后台生产）。
 
 Bad Tests:
-- 不启动真实推理服务，不用 Ray 集群；远程调用用替身 + ray.get 补丁。
+- 不启动真实推理服务，不用 Ray 集群；远程调用用可等待替身。
 """
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from xtuner.v1.rl.agent_loop_manager import ProduceBatchResult
 from xtuner.v1.rl.rollout.controller import RolloutController
 from xtuner.v1.rl.rollout.worker import (
     SERVING_GAUGE_KEYS,
@@ -98,65 +100,162 @@ class TestAggregateServingMetrics(unittest.TestCase):
 
 
 class TestServingStepValues(unittest.TestCase):
-    def test_first_scrape_yields_zero_deltas(self):
-        values = BaseRLTrainer._serving_step_values(None, {"prompt_tokens": 100.0, "requests_running": 3.0})
-        self.assertEqual(values["prompt_tokens"], 0.0)
-        self.assertEqual(values["requests_running"], 3.0)
+    def setUp(self) -> None:
+        self.trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+        self.trainer._last_serving_metrics = {}
 
-    def test_counter_deltas_and_gauge_passthrough(self):
-        previous = {"prompt_tokens": 100.0, "requests_running": 3.0, "gpu_cache_usage": 0.5}
-        current = {"prompt_tokens": 130.0, "requests_running": 1.0, "gpu_cache_usage": 0.7}
-        values = BaseRLTrainer._serving_step_values(previous, current)
+    def test_first_scrape_establishes_baseline_without_inventing_deltas(self) -> None:
+        values = self.trainer._serving_step_values({"a": {"prompt_tokens": 100.0, "requests_running": 3.0}}, 0)
+        self.assertNotIn("prompt_tokens", values)
+        self.assertNotIn("ttft_mean", values)
+        self.assertEqual(values["requests_running"], 3.0)
+        self.assertEqual(values["window_steps"], 0.0)
+
+    def test_counter_deltas_and_gauge_passthrough(self) -> None:
+        self.trainer._serving_step_values({"a": {"prompt_tokens": 100.0, "requests_running": 3.0}}, 0)
+        values = self.trainer._serving_step_values({"a": {"prompt_tokens": 130.0, "requests_running": 1.0}}, 1)
         self.assertEqual(values["prompt_tokens"], 30.0)
         self.assertEqual(values["requests_running"], 1.0)
-        self.assertEqual(values["gpu_cache_usage"], 0.7)
+        self.assertEqual(values["window_steps"], 1.0)
 
-    def test_counter_reset_is_clamped_to_zero(self):
-        # 行为：服务重启导致 counter 归零时，本步记 0 而不是负数
-        values = BaseRLTrainer._serving_step_values(
-            {"prompt_tokens": 500.0},
-            {"prompt_tokens": 20.0},
+    def test_partial_failure_does_not_manufacture_counter_growth(self) -> None:
+        self.trainer._serving_step_values({"a": {"prompt_tokens": 100.0}, "b": {"prompt_tokens": 100.0}}, 0)
+        partial = self.trainer._serving_step_values({"a": {"prompt_tokens": 110.0}, "b": {}}, 1)
+        recovered = self.trainer._serving_step_values(
+            {"a": {"prompt_tokens": 120.0}, "b": {"prompt_tokens": 120.0}}, 2
         )
-        self.assertEqual(values["prompt_tokens"], 0.0)
+        self.assertEqual(partial["prompt_tokens"], 10.0)
+        self.assertEqual(recovered["prompt_tokens"], 30.0)
+        self.assertEqual(partial["prompt_tokens"] + recovered["prompt_tokens"], 40.0)
+        self.assertEqual(recovered["window_steps"], 2.0)
 
-    def test_new_counter_key_after_first_step_is_zero(self):
-        # 行为：首个 baseline 缺失的 key（如首次出现的 reason 拆分）记 0，不累计全量
-        values = BaseRLTrainer._serving_step_values({"prompt_tokens": 10.0}, {"prompt_tokens": 15.0, "finished": 4.0})
-        self.assertEqual(values["finished"], 0.0)
+    def test_failed_scrapes_preserve_tokens_requests_and_histograms(self) -> None:
+        self.trainer._serving_step_values(
+            {"a": {"prompt_tokens": 100.0, "finished": 10.0, "ttft_sum": 5.0, "ttft_count": 10.0}}, 0
+        )
+        self.assertEqual(self.trainer._serving_step_values(None, 1), {})
+        self.assertEqual(self.trainer._serving_step_values({"a": {}}, 2), {})
+        values = self.trainer._serving_step_values(
+            {"a": {"prompt_tokens": 140.0, "finished": 14.0, "ttft_sum": 7.0, "ttft_count": 14.0}}, 3
+        )
+        self.assertEqual(values["prompt_tokens"], 40.0)
+        self.assertEqual(values["finished"], 4.0)
+        self.assertEqual(values["ttft_mean"], 0.5)
+        self.assertEqual(values["window_steps"], 3.0)
+
+    def test_counter_reset_does_not_cancel_other_endpoint_growth(self) -> None:
+        self.trainer._serving_step_values({"a": {"prompt_tokens": 500.0}, "b": {"prompt_tokens": 100.0}}, 0)
+        values = self.trainer._serving_step_values({"a": {"prompt_tokens": 20.0}, "b": {"prompt_tokens": 110.0}}, 1)
+        self.assertEqual(values["prompt_tokens"], 30.0)
+
+    def test_new_endpoint_and_new_key_only_establish_baselines(self) -> None:
+        self.trainer._serving_step_values({"a": {"prompt_tokens": 10.0}}, 0)
+        values = self.trainer._serving_step_values(
+            {"a": {"prompt_tokens": 15.0, "finished": 4.0}, "b": {"prompt_tokens": 1000.0}}, 1
+        )
+        self.assertNotIn("finished", values)
         self.assertEqual(values["prompt_tokens"], 5.0)
 
-    def test_histogram_means_derive_from_deltas(self):
-        previous = {"ttft_sum": 10.0, "ttft_count": 20.0, "e2e_sum": 100.0, "e2e_count": 20.0}
-        current = {"ttft_sum": 16.0, "ttft_count": 30.0, "e2e_sum": 100.0, "e2e_count": 20.0}
-        values = BaseRLTrainer._serving_step_values(previous, current)
-        self.assertAlmostEqual(values["ttft_mean"], 6.0 / 10.0)
-        self.assertAlmostEqual(values["e2e_mean"], 0.0)
-        # 原始 sum/count 不直接写出
+    def test_removed_endpoint_is_not_reused_as_a_baseline(self) -> None:
+        self.trainer._serving_step_values({"a": {"prompt_tokens": 10.0}}, 0)
+        self.assertEqual(self.trainer._serving_step_values({}, 1), {})
+        self.assertEqual(self.trainer._serving_step_values({"a": {"prompt_tokens": 100.0}}, 2), {})
+
+    def test_histogram_means_are_weighted_by_observation_count(self) -> None:
+        self.trainer._serving_step_values(
+            {"a": {"ttft_sum": 10.0, "ttft_count": 20.0}, "b": {"ttft_sum": 2.0, "ttft_count": 2.0}}, 0
+        )
+        values = self.trainer._serving_step_values(
+            {"a": {"ttft_sum": 16.0, "ttft_count": 30.0}, "b": {"ttft_sum": 6.0, "ttft_count": 4.0}}, 1
+        )
+        self.assertAlmostEqual(values["ttft_mean"], 10.0 / 12.0)
         self.assertNotIn("ttft_sum", values)
         self.assertNotIn("ttft_count", values)
 
+    def test_histogram_reset_uses_matching_sum_and_count(self) -> None:
+        # Count decreased but sum increased: both fields must use the new lifetime.
+        self.trainer._serving_step_values({"a": {"ttft_sum": 10.0, "ttft_count": 20.0}}, 0)
+        values = self.trainer._serving_step_values({"a": {"ttft_sum": 12.0, "ttft_count": 2.0}}, 1)
+        self.assertEqual(values["ttft_mean"], 6.0)
 
-class TestTrainerCollectServingMetrics(unittest.TestCase):
-    def test_collects_via_ray_remote(self):
-        # 行为：经 rollout controller actor 的 .remote() + ray.get 拿聚合指标
+    def test_no_observations_or_missing_sum_does_not_report_zero_latency(self) -> None:
+        self.trainer._serving_step_values({"a": {"ttft_sum": 10.0, "ttft_count": 20.0, "e2e_count": 1.0}}, 0)
+        values = self.trainer._serving_step_values({"a": {"ttft_sum": 10.0, "ttft_count": 20.0, "e2e_count": 2.0}}, 1)
+        self.assertEqual(values, {})
+
+
+class TestServingMetricLogging(unittest.TestCase):
+    def test_logging_does_not_scrape_or_fabricate_missing_metrics(self) -> None:
         trainer = BaseRLTrainer.__new__(BaseRLTrainer)
-        trainer.rollout_controller = SimpleNamespace(collect_server_metrics=SimpleNamespace(remote=lambda: "ref"))
-        with patch(
-            "xtuner.v1.train.rl_trainer.ray.get",
-            side_effect=lambda ref, timeout=None: {"prompt_tokens": 3.0},
-        ):
-            self.assertEqual(trainer._collect_serving_metrics(), {"prompt_tokens": 3.0})
+        trainer.logger = MagicMock()
+        trainer._total_train_steps = 1
+        trainer._exp_tracker = MagicMock()
+        trainer.rollout_controller = MagicMock()
+        for serving_values in (None, {}, {"generation_tokens": 40.0, "window_steps": 2.0}):
+            with self.subTest(serving_values=serving_values):
+                trainer._log_step(
+                    1, {}, ProduceBatchResult(rollout_states=[]), {}, {}, serving_step_values=serving_values
+                )
+                scalars = trainer._exp_tracker.add_scalars.call_args.kwargs["tag_scalar_dict"]
+                self.assertEqual(
+                    {key: value for key, value in scalars.items() if key.startswith("serving/")},
+                    {f"serving/{key}": value for key, value in (serving_values or {}).items()},
+                )
+        trainer.rollout_controller.collect_server_metrics.remote.assert_not_called()
 
-    def test_controller_without_method_fails_open(self):
+
+class TestTrainerCollectServingMetrics(unittest.IsolatedAsyncioTestCase):
+    async def test_collects_without_blocking_other_tasks(self) -> None:
+        trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+        producer_progress = asyncio.Event()
+
+        async def scrape() -> dict[str, dict[str, float]]:
+            await producer_progress.wait()
+            return {"a": {"prompt_tokens": 3.0}}
+
+        trainer.rollout_controller = SimpleNamespace(collect_server_metrics=SimpleNamespace(remote=scrape))
+        task = asyncio.create_task(trainer._collect_serving_metrics())
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        producer_progress.set()
+        with patch("xtuner.v1.train.rl_trainer.ray.get", side_effect=AssertionError("blocking ray.get")):
+            self.assertEqual(await asyncio.wait_for(task, 1.0), {"a": {"prompt_tokens": 3.0}})
+
+    async def test_controller_without_method_fails_open(self) -> None:
         trainer = BaseRLTrainer.__new__(BaseRLTrainer)
         trainer.rollout_controller = SimpleNamespace()
-        self.assertEqual(trainer._collect_serving_metrics(), {})
+        self.assertIsNone(await trainer._collect_serving_metrics())
 
-    def test_none_result_fails_open(self):
+    async def test_remote_failure_is_not_an_empty_registry(self) -> None:
         trainer = BaseRLTrainer.__new__(BaseRLTrainer)
-        trainer.rollout_controller = SimpleNamespace(collect_server_metrics=SimpleNamespace(remote=lambda: "ref"))
-        with patch("xtuner.v1.train.rl_trainer.ray.get", side_effect=lambda ref, timeout=None: None):
-            self.assertEqual(trainer._collect_serving_metrics(), {})
+        trainer.rollout_controller = SimpleNamespace(
+            collect_server_metrics=SimpleNamespace(remote=AsyncMock(side_effect=RuntimeError("actor down")))
+        )
+        self.assertIsNone(await trainer._collect_serving_metrics())
+
+    async def test_timeout_is_bounded_and_cleans_up_local_waiter(self) -> None:
+        trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+        cancelled = asyncio.Event()
+
+        async def scrape() -> dict[str, dict[str, float]]:
+            try:
+                await asyncio.Event().wait()
+                return {}
+            finally:
+                cancelled.set()
+
+        trainer.rollout_controller = SimpleNamespace(collect_server_metrics=SimpleNamespace(remote=scrape))
+        with patch("xtuner.v1.train.rl_trainer.SERVING_METRICS_GATHER_TIMEOUT_S", 0.01):
+            self.assertIsNone(await trainer._collect_serving_metrics())
+        self.assertTrue(cancelled.is_set())
+
+    async def test_cancellation_is_not_swallowed(self) -> None:
+        trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+        trainer.rollout_controller = SimpleNamespace(
+            collect_server_metrics=SimpleNamespace(remote=AsyncMock(side_effect=asyncio.CancelledError))
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await trainer._collect_serving_metrics()
 
 
 def _bare_worker(server_url: str = "http://127.0.0.1:12345") -> RolloutWorker:
@@ -191,48 +290,76 @@ class TestWorkerScrapeMetrics(unittest.TestCase):
 
 
 class _FakeEndpoint:
-    def __init__(self, metrics: dict[str, float] | Exception):
-        self._metrics = metrics
-        actor = SimpleNamespace()
-        if isinstance(metrics, Exception):
-
-            def raise_remote():
-                raise metrics
-
-            actor.scrape_metrics = SimpleNamespace(remote=raise_remote)
-        else:
-            actor.scrape_metrics = SimpleNamespace(remote=lambda: metrics)
-        self.actor = actor
+    def __init__(self, url: str, metrics: dict[str, float] | Exception, *, active: bool = True) -> None:
+        self.url = url
+        self.is_request_entrypoint = True
+        self.is_active = lambda: active
+        remote = AsyncMock(side_effect=metrics) if isinstance(metrics, Exception) else AsyncMock(return_value=metrics)
+        self.actor = SimpleNamespace(scrape_metrics=SimpleNamespace(remote=remote))
 
 
-class TestControllerCollectServerMetrics(unittest.TestCase):
-    def _controller(self, entrypoints) -> RolloutController:
+class TestControllerCollectServerMetrics(unittest.IsolatedAsyncioTestCase):
+    def _controller(self, entrypoints: list[_FakeEndpoint]) -> RolloutController:
         controller = RolloutController.__new__(RolloutController)
-        controller.registry = SimpleNamespace(active_entrypoints=lambda: entrypoints)
+        controller.registry = SimpleNamespace(all_workers=lambda: entrypoints)
         controller.logger = MagicMock()
         return controller
 
-    def test_aggregates_across_entrypoints(self):
+    async def test_preserves_endpoint_identity(self) -> None:
         controller = self._controller(
             [
-                _FakeEndpoint({"requests_running": 2.0, "prompt_tokens": 100.0}),
-                _FakeEndpoint({"requests_running": 6.0, "prompt_tokens": 50.0}),
+                _FakeEndpoint("a", {"requests_running": 2.0, "prompt_tokens": 100.0}),
+                _FakeEndpoint("b", {"requests_running": 6.0, "prompt_tokens": 50.0}),
             ]
         )
-        with patch("xtuner.v1.rl.rollout.controller.ray.get", side_effect=lambda refs, timeout=None: list(refs)):
-            metrics = controller.collect_server_metrics()
-        self.assertEqual(metrics["requests_running"], 4.0)
-        self.assertEqual(metrics["prompt_tokens"], 150.0)
+        with patch("xtuner.v1.rl.rollout.controller.ray.get", side_effect=AssertionError("blocking ray.get")):
+            metrics = await controller.collect_server_metrics()
+        self.assertEqual(metrics["a"]["prompt_tokens"], 100.0)
+        self.assertEqual(metrics["b"]["prompt_tokens"], 50.0)
 
-    def test_no_entrypoints_returns_empty(self):
-        controller = self._controller([])
-        self.assertEqual(controller.collect_server_metrics(), {})
+    async def test_no_entrypoints_returns_empty(self) -> None:
+        self.assertEqual(await self._controller([]).collect_server_metrics(), {})
 
-    def test_ray_failure_fails_open(self):
-        # 行为：任一端点抓取抛异常时整体 fail-open，绝不向训练传播
-        controller = self._controller([_FakeEndpoint(RuntimeError("actor died"))])
-        with patch("xtuner.v1.rl.rollout.controller.ray.get", side_effect=RuntimeError("ray.get failed")):
-            self.assertEqual(controller.collect_server_metrics(), {})
+    async def test_failed_and_inactive_endpoints_do_not_discard_healthy_results(self) -> None:
+        inactive = _FakeEndpoint("inactive", {}, active=False)
+        non_entrypoint = _FakeEndpoint("non-entrypoint", {})
+        non_entrypoint.is_request_entrypoint = False
+        controller = self._controller(
+            [
+                _FakeEndpoint("a", {"prompt_tokens": 100.0}),
+                _FakeEndpoint("b", RuntimeError("actor died")),
+                inactive,
+                non_entrypoint,
+            ]
+        )
+        self.assertEqual(
+            await controller.collect_server_metrics(),
+            {
+                "a": {"prompt_tokens": 100.0},
+                "b": {},
+                "inactive": {},
+            },
+        )
+        inactive.actor.scrape_metrics.remote.assert_not_called()
+        non_entrypoint.actor.scrape_metrics.remote.assert_not_called()
+
+    async def test_slow_endpoint_times_out_without_discarding_healthy_results(self) -> None:
+        slow = _FakeEndpoint("slow", {})
+        cancelled = asyncio.Event()
+
+        async def scrape() -> dict[str, float]:
+            try:
+                await asyncio.Event().wait()
+                return {}
+            finally:
+                cancelled.set()
+
+        slow.actor.scrape_metrics.remote = scrape
+        controller = self._controller([slow, _FakeEndpoint("a", {"prompt_tokens": 100.0})])
+        with patch("xtuner.v1.rl.rollout.controller.SERVING_METRICS_GATHER_TIMEOUT_S", 0.01):
+            metrics = await controller.collect_server_metrics()
+        self.assertEqual(metrics, {"slow": {}, "a": {"prompt_tokens": 100.0}})
+        self.assertTrue(cancelled.is_set())
 
 
 if __name__ == "__main__":
