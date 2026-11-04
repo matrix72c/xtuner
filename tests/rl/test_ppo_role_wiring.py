@@ -278,6 +278,7 @@ class TestCriticConstruction(unittest.TestCase):
             worker = CriticWorker(critic_cfg, host=host)
 
         self.assertIs(worker.host, host)
+        self.assertIs(worker.loss_cfg, critic_cfg.loss_cfg)
         self.assertIs(train_engine.call_args.kwargs["fsdp_cfg"], fsdp_cfg)
         self.assertIs(build_scheduler.call_args.args[0], train_engine.return_value.optimizer)
         train_engine.return_value.from_hf.assert_called_once_with("/tmp/critic", strict=False)
