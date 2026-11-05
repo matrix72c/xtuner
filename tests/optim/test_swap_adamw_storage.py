@@ -263,8 +263,7 @@ class TestSwapAdamWStorageGPU:
         assert torch.all(copied == 7)
         del churn
 
-    @pytest.mark.parametrize("rows", [1, 5])
-    def test_dtensor_uneven_and_empty_shards(self, rows: int, tmp_path: Path) -> None:
+    def test_dtensor_uneven_and_empty_shards(self, tmp_path: Path) -> None:
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
         if "RANK" in os.environ:
             dist.init_process_group("nccl")
@@ -272,20 +271,22 @@ class TestSwapAdamWStorageGPU:
             dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
         try:
             mesh = init_device_mesh("cuda", (dist.get_world_size(),))
-            param = torch.nn.Parameter(distribute_tensor(torch.ones(rows, 3, device="cuda"), mesh, [Shard(0)]))
-            optimizer = SwapAdamW([param], amsgrad=True, foreach=False)
-            reference = torch.nn.Parameter(param.to_local().detach().clone())
-            expected = torch.optim.AdamW([reference], amsgrad=True, foreach=False)
-            for _ in range(3):
-                param.grad = torch.ones_like(param)
-                reference.grad = torch.ones_like(reference)
-                optimizer.step()
-                expected.step()
-                torch.testing.assert_close(param.to_local(), reference)
-                for key in optimizer._state_keys:
-                    state = optimizer.state[param][key]
-                    assert state.shape == param.shape and state.placements == param.placements
-                    assert state.to_local().shape == param.to_local().shape
-                    torch.testing.assert_close(state.to_local(), expected.state[reference][key].cpu())
+            # Reuse one process group: destroy/reinitialize with the same torchrun store can race across ranks.
+            for rows in (1, 5):
+                param = torch.nn.Parameter(distribute_tensor(torch.ones(rows, 3, device="cuda"), mesh, [Shard(0)]))
+                optimizer = SwapAdamW([param], amsgrad=True, foreach=False)
+                reference = torch.nn.Parameter(param.to_local().detach().clone())
+                expected = torch.optim.AdamW([reference], amsgrad=True, foreach=False)
+                for _ in range(3):
+                    param.grad = torch.ones_like(param)
+                    reference.grad = torch.ones_like(reference)
+                    optimizer.step()
+                    expected.step()
+                    torch.testing.assert_close(param.to_local(), reference)
+                    for key in optimizer._state_keys:
+                        state = optimizer.state[param][key]
+                        assert state.shape == param.shape and state.placements == param.placements
+                        assert state.to_local().shape == param.to_local().shape
+                        torch.testing.assert_close(state.to_local(), expected.state[reference][key].cpu())
         finally:
             dist.destroy_process_group()
