@@ -55,6 +55,7 @@ from xtuner.v1.utils.load_spec import (
 )
 from xtuner.v1.utils.loader import HFCheckpointLoader
 from xtuner.v1.utils.misc import FunctionEnum, FunctionType, get_function_full_qualname, get_function_type
+from xtuner.v1.utils.model_offload import offload_to_pinned_cpu
 from xtuner.v1.utils.process import (
     get_async_hf_save_file_lock_slots,
     get_async_hf_writer_join_timeout,
@@ -2007,7 +2008,10 @@ class BaseModel(nn.Module):
     def to_device(self, device: torch.device | str):
         if self.fsdp_config is not None and self.fsdp_config.cpu_offload:
             return
-        self.to(device, non_blocking=True)
+        if torch.device(device).type == "cpu":
+            offload_to_pinned_cpu(self)
+        else:
+            self.to(device, non_blocking=True)
         DEVICE_MODULE.synchronize()
         return
 
