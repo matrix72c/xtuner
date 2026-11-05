@@ -47,3 +47,20 @@ class TestPinnedMemory:
             ranges.sort()
             assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
         assert allocate_pinned_like([]) == []
+
+    def test_copies_preserve_layout_and_do_not_capture_autograd(self) -> None:
+        tensors = [torch.arange(15.0).reshape(3, 5).t().requires_grad_(), torch.ones(1, 2).as_strided((1, 2), (99, 1))]
+        original = torch.empty
+
+        def empty(*args: Any, **kwargs: Any) -> torch.Tensor:
+            kwargs.pop("pin_memory", None)
+            return original(*args, **kwargs)
+
+        with patch.object(torch, "empty", empty):
+            views = allocate_pinned_like(tensors, copy_non_blocking=True)
+        for source, view in zip(tensors, views):
+            torch.testing.assert_close(view, source)
+            assert view.stride() == torch.empty_like(source).stride()
+            assert not view.requires_grad and view.grad_fn is None
+        with pytest.raises(ValueError):
+            allocate_pinned_like(tensors, zero=True, copy_non_blocking=True)

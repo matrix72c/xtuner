@@ -3,8 +3,10 @@
 import torch
 
 
-def allocate_pinned_like(tensors: list[torch.Tensor], *, zero: bool = False) -> list[torch.Tensor]:
-    """Allocate compatible dense layouts in bounded pinned slabs without copying inputs.
+def allocate_pinned_like(
+    tensors: list[torch.Tensor], *, zero: bool = False, copy_non_blocking: bool = False
+) -> list[torch.Tensor]:
+    """Allocate compatible dense layouts in bounded pinned slabs.
 
     Ordinary views retain the host allocator's stream-event context. Full-state
     torch.save deduplicates their storage; DCP compacts individual views. A raw
@@ -13,11 +15,20 @@ def allocate_pinned_like(tensors: list[torch.Tensor], *, zero: bool = False) -> 
     Args:
         tensors (list[torch.Tensor]): Plain strided tensors supplying shape, dtype and layout.
         zero (bool): Initialize each slab to zero before exposing its views.
+        copy_non_blocking (bool): Copy each source without autograd as soon as its view is allocated,
+            overlapping transfers with subsequent allocations. The caller must synchronize before CPU use.
 
     Returns:
         list[torch.Tensor]: CPU views in input order, with empty_like preserve-format layouts.
     """
-    layouts = [torch.empty_like(tensor, device="meta", memory_format=torch.preserve_format) for tensor in tensors]
+    if zero and copy_non_blocking:
+        raise ValueError("Choose either zero initialization or source copies")
+    layouts = [
+        tensor
+        if tensor.is_contiguous()
+        else torch.empty_like(tensor, device="meta", memory_format=torch.preserve_format)
+        for tensor in tensors
+    ]
     groups: dict[tuple[torch.device, torch.dtype], list[int]] = {}
     for index, tensor in enumerate(tensors):
         groups.setdefault((tensor.device, tensor.dtype), []).append(index)
@@ -35,7 +46,11 @@ def allocate_pinned_like(tensors: list[torch.Tensor], *, zero: bool = False) -> 
             for member in members:
                 index = indices[member]
                 layout = layouts[index]
-                result[index] = slab.as_strided(layout.shape, layout.stride(), offset)
+                view = slab.as_strided(layout.shape, layout.stride(), offset)
+                if copy_non_blocking:
+                    with torch.no_grad():
+                        view.copy_(tensors[index], non_blocking=True)
+                result[index] = view
                 offset += layout.numel()
     assert all(tensor is not None for tensor in result)
     return [tensor for tensor in result if tensor is not None]
