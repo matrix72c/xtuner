@@ -28,6 +28,8 @@ class _TinyModel(BaseModel):
     def to_hf_key_list(self, key: str) -> list[str]:
         return [key]
 
+    _model_hf_keys = to_hf_key_list
+
 
 class TestHFLoaderLifetime:
     @pytest.mark.parametrize("outcome", ["success", "load_error", "missing_tensor"])
