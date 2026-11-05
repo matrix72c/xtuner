@@ -1,10 +1,12 @@
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
+from xtuner.v1.utils.dtensor import dtensor_checkpoint_view
 from xtuner.v1.utils.pinned_memory import allocate_pinned_like, plan_pinned_slabs
 
 from .adamw import AdamW
@@ -64,6 +66,26 @@ class SwapAdamW(AdamW):
         self._param_to_group_map: dict[torch.Tensor, dict] = {}
         self._param_to_cpu_states_map: dict[torch.Tensor, dict[str, torch.Tensor | None]] = {}
         self._init_swap_states()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return serializable checkpoint views without copying tensor storage.
+
+        Run the standard pre/post hooks first. Copy the per-parameter dictionaries
+        before replacing offset DTensor wrappers, since Optimizer.state_dict
+        otherwise shares those dictionaries with the live optimizer state.
+
+        Returns:
+            dict[str, Any]: Optimizer checkpoint with the usual state/group layout.
+        """
+        result = super().state_dict()
+        result["state"] = {
+            key: {
+                name: dtensor_checkpoint_view(value) if isinstance(value, torch.Tensor) else value
+                for name, value in state.items()
+            }
+            for key, state in result["state"].items()
+        }
+        return result
 
     def put_state_to_device(self, device: torch.device | str) -> bool:
         """Keep the canonical optimizer state on the host."""
