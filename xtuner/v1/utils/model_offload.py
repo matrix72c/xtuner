@@ -63,12 +63,11 @@ def offload_to_pinned_cpu(module: nn.Module) -> None:
         sources.append(source)
         selected.append((identity, tensor, local))
 
-    destinations = allocate_pinned_like(sources)
+    destinations = allocate_pinned_like(sources, copy_non_blocking=True)
     converted: dict[int, torch.Tensor] = {}
     padded: dict[int, torch.Tensor] = {}
     with torch.no_grad():
-        for (identity, tensor, local), source, destination in zip(selected, sources, destinations):
-            destination.copy_(source, non_blocking=True)
+        for (identity, tensor, local), destination in zip(selected, destinations):
             fsdp_param = fsdp_params.get(identity)
             view = destination
             if fsdp_param is not None:
