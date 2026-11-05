@@ -28,8 +28,13 @@ def offload_to_pinned_cpu(module: nn.Module) -> None:
             child.reshard()
             group = child._get_fsdp_state()._fsdp_param_group
             if group is not None:
-                for sharded in group.fsdp_params:
-                    fsdp_params[id(sharded.sharded_param)] = sharded
+                with torch.no_grad():
+                    for sharded in group.fsdp_params:
+                        # HF loading can materialize ordinary descendants with recurse=False,
+                        # bypassing the owning FSDP parent's _apply hook. Refresh before reading
+                        # the padded backing: it may still be meta or refer to old CUDA storage.
+                        sharded.reset_sharded_param()
+                        fsdp_params[id(sharded.sharded_param)] = sharded
 
     tensors: dict[int, torch.Tensor] = {}
     for param in module.parameters():
