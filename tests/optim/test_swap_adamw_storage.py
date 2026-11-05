@@ -9,6 +9,7 @@ import importlib
 import io
 import os
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,8 +18,9 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from xtuner.v1.optim.swap_adamw import SwapAdamW, _plan_pinned_slabs
 
@@ -56,6 +58,16 @@ def cpu_allocation(monkeypatch: pytest.MonkeyPatch) -> list[int]:
         swap_module, "DEVICE_MODULE", SimpleNamespace(current_device=lambda: 0, synchronize=lambda: None)
     )
     return allocations
+
+
+@pytest.fixture
+def fake_cpu_mesh() -> Iterator[DeviceMesh]:
+    # The trailing rank covers both uneven and empty shards without a GPU or subprocess.
+    dist.init_process_group("fake", rank=1, world_size=2, store=FakeStore())
+    try:
+        yield init_device_mesh("cpu", (2,))
+    finally:
+        dist.destroy_process_group()
 
 
 class TestPinnedSlabPlan:
@@ -182,6 +194,81 @@ class TestSwapAdamWStorageCPU:
                 assert state.to_local().data_ptr() == optimizer._param_to_cpu_states_map[param][key].data_ptr()
         finally:
             dist.destroy_process_group()
+
+    @pytest.mark.parametrize("amsgrad", [False, True])
+    def test_dtensor_checkpoint_preserves_live_state_and_hooks(
+        self, fake_cpu_mesh: DeviceMesh, cpu_allocation: list[int], amsgrad: bool
+    ) -> None:
+        params = [
+            torch.nn.Parameter(distribute_tensor(torch.empty(rows, 3), fake_cpu_mesh, [Shard(0)])) for rows in (5, 1)
+        ]
+        optimizer = SwapAdamW(params, amsgrad=amsgrad)
+        originals = [optimizer.state[param].copy() for param in params]
+        allocations = cpu_allocation.copy()
+        for state in originals:
+            for index, key in enumerate(optimizer._state_keys):
+                if state[key] is not None:
+                    state[key]._local_tensor.fill_(index + 1)
+        assert any(
+            isinstance(value, DTensor) and value.storage_offset() > 0
+            for state in originals
+            for value in state.values()
+        )
+        events: list[str] = []
+        optimizer.register_state_dict_pre_hook(lambda _: events.append("pre-last"))
+        optimizer.register_state_dict_pre_hook(lambda _: events.append("pre-first"), prepend=True)
+
+        def replace_post_hook(optim: SwapAdamW, state: dict[str, Any]) -> dict[str, Any]:
+            events.append("post-first")
+            assert state["state"][0] is optim.state[params[0]]
+            return {**state, "hook_marker": 7}
+
+        def inspect_post_hook(optim: SwapAdamW, state: dict[str, Any]) -> None:
+            events.append("post-last")
+            assert state["hook_marker"] == 7
+            assert state["state"][0] is optim.state[params[0]]
+
+        optimizer.register_state_dict_post_hook(inspect_post_hook)
+        optimizer.register_state_dict_post_hook(replace_post_hook, prepend=True)
+        checkpoint = optimizer.state_dict()
+        assert events == ["pre-first", "pre-last", "post-first", "post-last"]
+        assert checkpoint["hook_marker"] == 7
+        assert cpu_allocation == allocations
+        for index, (param, original) in enumerate(zip(params, originals)):
+            saved = checkpoint["state"][index]
+            assert saved is not optimizer.state[param]
+            for key, value in original.items():
+                assert optimizer.state[param][key] is value
+                if isinstance(value, DTensor):
+                    assert saved[key]._spec is value._spec
+                    assert saved[key]._local_tensor is value._local_tensor
+                    assert value._local_tensor is optimizer._param_to_cpu_states_map[param][key]
+                    assert saved[key].storage_offset() == 0
+                else:
+                    assert saved[key] is value
+        stream = io.BytesIO()
+        torch.save(checkpoint, stream)
+        stream.seek(0)
+        restored = torch.load(stream, weights_only=False)
+        assert restored["param_groups"] == checkpoint["param_groups"]
+        assert restored["hook_marker"] == 7
+        for index, original in enumerate(originals):
+            for key, value in original.items():
+                actual = restored["state"][index][key]
+                if isinstance(value, DTensor):
+                    torch.testing.assert_close(actual.to_local(), value.to_local())
+                    assert actual.shape == value.shape and actual.stride() == value.stride()
+                    assert actual.placements == value.placements and actual.device_mesh == value.device_mesh
+                    assert actual._local_tensor.storage_offset() == value._local_tensor.storage_offset()
+                elif value is None:
+                    assert actual is None
+                else:
+                    torch.testing.assert_close(actual, value)
+        saved_moments = restored["state"][0]
+        assert (
+            saved_moments["exp_avg"]._local_tensor.untyped_storage()
+            is saved_moments["exp_avg_sq"]._local_tensor.untyped_storage()
+        )
 
     @pytest.mark.parametrize("amsgrad", [False, True])
     def test_multiple_steps_match_adamw(self, amsgrad: bool) -> None:
