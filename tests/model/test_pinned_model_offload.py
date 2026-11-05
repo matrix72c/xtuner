@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
@@ -187,6 +187,68 @@ class TestModelOffloadGPU:
         torch.testing.assert_close(model.sparse.to_dense(), torch.eye(3))
         model.differentiable.sum().backward()
         torch.testing.assert_close(source.grad, torch.ones(3, device="cuda"))
+
+    @pytest.mark.parametrize("initial_device", ["meta", "cuda"])
+    def test_hf_load_refreshes_parent_owned_shards_before_first_forward(
+        self, tmp_path: Path, initial_device: str
+    ) -> None:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if "RANK" in os.environ:
+            dist.init_process_group("nccl")
+        else:
+            dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
+        try:
+            torch.manual_seed(42)
+            reference = TinyModel("cuda")
+            save_file(
+                {name: value.cpu() for name, value in reference.state_dict().items()}, tmp_path / "model.safetensors"
+            )
+            model = TinyModel(initial_device)
+            mesh = init_device_mesh("cuda", (dist.get_world_size(),))
+            # The parent owns ordinary leaf parameters. Leaf-only materialization does not
+            # run that parent's FSDP _apply reset, exactly as in recursive HF loading.
+            fully_shard(model, mesh=mesh)
+            if initial_device == "cuda":
+                model.first.to_empty(device="cuda", recurse=False)
+                model.last.to_empty(device="cuda", recurse=False)
+            assert model.from_hf(tmp_path) == (set(reference.state_dict()), set(), set())
+            group = model._get_fsdp_state()._fsdp_param_group
+            assert group is not None
+            assert all(param.sharded_param._local_tensor.device.type == "cuda" for param in group.fsdp_params)
+            if initial_device == "meta":
+                assert all(param._sharded_param_data.is_meta for param in group.fsdp_params)
+            identities = {name: id(param) for name, param in model.named_parameters()}
+            snapshot = {name: _local(param).detach().cpu().clone() for name, param in model.named_parameters()}
+            for _ in range(3):
+                model.to_device("cpu")
+                assert {name: id(param) for name, param in model.named_parameters()} == identities
+                for name, param in model.named_parameters():
+                    torch.testing.assert_close(_local(param), snapshot[name])
+                for param in group.fsdp_params:
+                    backing = param._sharded_param_data
+                    assert backing.is_pinned() and backing.numel() == param.padded_sharded_param_size.numel()
+                    assert backing.untyped_storage() is param.sharded_param._local_tensor.untyped_storage()
+                stream = io.BytesIO()
+                torch.save(model.state_dict(), stream)
+                stream.seek(0)
+                restored = torch.load(stream, weights_only=False)
+                for name in snapshot:
+                    torch.testing.assert_close(_local(restored[name]), snapshot[name])
+                model.to_device("cuda")
+            inputs = torch.ones(2, 7, device="cuda")
+            torch.testing.assert_close(model(inputs), reference(inputs))
+            model(inputs).sum().backward()
+            reference(inputs).sum().backward()
+            actual_optim = torch.optim.SGD(model.parameters(), lr=0.01)
+            expected_optim = torch.optim.SGD(reference.parameters(), lr=0.01)
+            actual_optim.step()
+            expected_optim.step()
+            actual_optim.zero_grad(set_to_none=True)
+            model.to_device("cpu")
+            model.to_device("cuda")
+            torch.testing.assert_close(model(inputs), reference(inputs))
+        finally:
+            dist.destroy_process_group()
 
     def test_fsdp_padded_backing_identity_and_training(self, tmp_path: Path) -> None:
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
