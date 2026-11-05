@@ -6,6 +6,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
+from xtuner.v1.utils.pinned_memory import allocate_pinned_like, plan_pinned_slabs
 
 from .adamw import AdamW
 
@@ -13,6 +14,7 @@ from .adamw import AdamW
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
 logger = get_logger()
+_plan_pinned_slabs = plan_pinned_slabs
 
 
 class SwapAdamW(AdamW):
@@ -186,10 +188,9 @@ class SwapAdamW(AdamW):
         )
 
         # Plan from metadata only: never materialize per-parameter states before allocating the slabs.
-        requests: dict[tuple[torch.device, torch.dtype], list[tuple[torch.Tensor, str, torch.Tensor]]] = {}
+        requests: list[tuple[torch.Tensor, str, torch.Tensor]] = []
         for param, group in self._param_to_group_map.items():
             local_param = self._to_local_tensor(param)
-            layout = torch.empty_like(local_param, device="meta", memory_format=torch.preserve_format)
             cpu_state: dict[str, torch.Tensor | None] = {}
             self._param_to_cpu_states_map[param] = cpu_state
             for key in self._state_keys:
@@ -197,30 +198,18 @@ class SwapAdamW(AdamW):
                     self.state[param][key] = None
                     cpu_state[key] = None
                 else:
-                    requests.setdefault((local_param.device, local_param.dtype), []).append((param, key, layout))
+                    requests.append((param, key, local_param))
             self.state[param]["step"] = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
-        for (_, dtype), entries in requests.items():
-            sizes = [layout.numel() * layout.element_size() for _, _, layout in entries]
-            for indices in _plan_pinned_slabs(sizes):
-                nbytes = sum(sizes[index] for index in indices)
-                slab = torch.empty(
-                    nbytes // entries[indices[0]][2].element_size(), dtype=dtype, device="cpu", pin_memory=True
-                )
-                slab.zero_()
-                offset = 0
-                for index in indices:
-                    param, key, layout = entries[index]
-                    # Ordinary views retain the allocator's DataPtr context for async copy event tracking.
-                    cpu_tensor = slab.as_strided(layout.shape, layout.stride(), offset // layout.element_size())
-                    state_tensor = cpu_tensor
-                    if isinstance(param, DTensor):
-                        # from_local moves CPU tensors to the mesh device, undoing offload. Construct directly
-                        # with the existing global spec, including nonuniform/empty local shard metadata.
-                        state_tensor = DTensor(cpu_tensor, param._spec, requires_grad=False)
-                    self.state[param][key] = state_tensor
-                    self._param_to_cpu_states_map[param][key] = cpu_tensor
-                    offset += sizes[index]
+        cpu_tensors = allocate_pinned_like([local_param for _, _, local_param in requests], zero=True)
+        for (param, key, _), cpu_tensor in zip(requests, cpu_tensors):
+            state_tensor = cpu_tensor
+            if isinstance(param, DTensor):
+                # from_local moves CPU tensors to the mesh device, undoing offload. Construct directly
+                # with the existing global spec, including nonuniform/empty local shard metadata.
+                state_tensor = DTensor(cpu_tensor, param._spec, requires_grad=False)
+            self.state[param][key] = state_tensor
+            self._param_to_cpu_states_map[param][key] = cpu_tensor
 
         DEVICE_MODULE.synchronize()
 
@@ -302,22 +291,3 @@ class SwapAdamW(AdamW):
 
         DEVICE_MODULE.synchronize()
         return loss
-
-
-def _plan_pinned_slabs(sizes: list[int], cap_bytes: int = 1 << 30) -> list[list[int]]:
-    # Best-fit-decreasing, with input index breaking ties. Plan independently for each device/dtype.
-    # Allocate only each bin's used bytes, not cap_bytes: the host allocator rounds small bins as needed.
-    # Requests larger than the cap are standalone; zero-sized shards require no pinned bytes.
-    bins: list[list[int]] = []
-    used: list[int] = []
-    for index in sorted(range(len(sizes)), key=lambda index: (-sizes[index], index)):
-        size = sizes[index]
-        candidates = [i for i, total in enumerate(used) if total <= cap_bytes and total + size <= cap_bytes]
-        if candidates:
-            best = min(candidates, key=lambda i: (cap_bytes - used[i] - size, i))
-            bins[best].append(index)
-            used[best] += size
-        else:
-            bins.append([index])
-            used.append(size)
-    return bins
