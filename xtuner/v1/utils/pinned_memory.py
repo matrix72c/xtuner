@@ -15,7 +15,7 @@ def allocate_pinned_like(
     Args:
         tensors (list[torch.Tensor]): Plain strided tensors supplying shape, dtype and layout.
         zero (bool): Initialize each slab to zero before exposing its views.
-        copy_non_blocking (bool): Copy each source without autograd as soon as its view is allocated,
+        copy_non_blocking (bool): Copy each slab's sources without autograd as soon as its views are allocated,
             overlapping transfers with subsequent allocations. The caller must synchronize before CPU use.
 
     Returns:
@@ -43,15 +43,20 @@ def allocate_pinned_like(
             if zero:
                 slab.zero_()
             offset = 0
+            copy_targets: list[torch.Tensor] = []
+            copy_sources: list[torch.Tensor] = []
             for member in members:
                 index = indices[member]
                 layout = layouts[index]
                 view = slab.as_strided(layout.shape, layout.stride(), offset)
                 if copy_non_blocking:
-                    with torch.no_grad():
-                        view.copy_(tensors[index], non_blocking=True)
+                    copy_targets.append(view)
+                    copy_sources.append(tensors[index])
                 result[index] = view
                 offset += layout.numel()
+            if copy_non_blocking:
+                with torch.no_grad():
+                    torch._foreach_copy_(copy_targets, copy_sources, non_blocking=True)
     assert all(tensor is not None for tensor in result)
     return [tensor for tensor in result if tensor is not None]
 
