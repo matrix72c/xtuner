@@ -1,3 +1,4 @@
+import random
 from typing import Any
 from unittest.mock import patch
 
@@ -16,6 +17,25 @@ class TestPinnedMemory:
             plan_pinned_slabs([-1])
         with pytest.raises(ValueError):
             plan_pinned_slabs([1], 0)
+
+    def test_plan_matches_reference_best_fit_ties(self) -> None:
+        rng = random.Random(42)
+        for _ in range(1000):
+            cap = rng.randint(1, 128)
+            sizes = [rng.randint(0, cap * 2) for _ in range(rng.randint(0, 100))]
+            expected: list[list[int]] = []
+            used: list[int] = []
+            for index in sorted(range(len(sizes)), key=lambda index: (-sizes[index], index)):
+                size = sizes[index]
+                fitting = [i for i, total in enumerate(used) if total <= cap and total + size <= cap]
+                if fitting:
+                    best = min(fitting, key=lambda i: (cap - used[i] - size, i))
+                    expected[best].append(index)
+                    used[best] += size
+                else:
+                    expected.append([index])
+                    used.append(size)
+            assert plan_pinned_slabs(sizes, cap) == expected
 
     def test_layout_zeroing_and_nonoverlap(self) -> None:
         tensors = [

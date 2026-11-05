@@ -1,5 +1,7 @@
 """Bounded pinned allocations with ordinary views that retain CUDA event ownership."""
 
+from bisect import bisect_left, insort
+
 import torch
 
 
@@ -74,15 +76,19 @@ def plan_pinned_slabs(sizes: list[int], cap_bytes: int = 1 << 30) -> list[list[i
     if cap_bytes <= 0 or any(size < 0 for size in sizes):
         raise ValueError("Slab cap must be positive and request sizes nonnegative")
     bins: list[list[int]] = []
-    used: list[int] = []
+    free: list[tuple[int, int]] = []
     for index in sorted(range(len(sizes)), key=lambda index: (-sizes[index], index)):
         size = sizes[index]
-        candidates = [i for i, total in enumerate(used) if total <= cap_bytes and total + size <= cap_bytes]
-        if candidates:
-            best = min(candidates, key=lambda i: (cap_bytes - used[i] - size, i))
+        # Sort by remaining capacity then slab index to retain deterministic BFD ties.
+        position = bisect_left(free, (size, -1))
+        if position < len(free):
+            remaining, best = free.pop(position)
             bins[best].append(index)
-            used[best] += size
         else:
+            best = len(bins)
             bins.append([index])
-            used.append(size)
+            remaining = cap_bytes
+        remaining -= size
+        if remaining >= 0:
+            insort(free, (remaining, best))
     return bins
