@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor
 
 from xtuner.v1.model.base import BaseModel
 from xtuner.v1.utils.model_offload import offload_to_pinned_cpu
+from xtuner.v1.utils.pinned_memory import allocate_pinned_like
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
@@ -78,6 +79,55 @@ class TestModelOffloadGPU:
             model.to_device("cuda")
         model(torch.ones(2, 7, device="cuda")).sum().backward()
 
+    def test_nondefault_stream_copy_lifetime(self) -> None:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        stream = torch.cuda.Stream()
+        shapes = [torch.empty(262145, device="meta") for _ in range(4)]
+        for _ in range(3):
+            with torch.cuda.stream(stream):
+                model = nn.Module()
+                for index in range(4):
+                    model.register_parameter(f"p{index}", nn.Parameter(torch.ones(262145, device="cuda")))
+                torch.cuda._sleep(5_000_000)
+                offload_to_pinned_cpu(model)
+                del model
+            # Freed views must retain their host allocator events until D2H finishes.
+            pressure = allocate_pinned_like(shapes)
+            for tensor in pressure:
+                tensor.fill_(-7)
+            stream.synchronize()
+            assert all(torch.all(tensor == -7) for tensor in pressure)
+            del pressure
+            with torch.cuda.stream(stream):
+                model = nn.Module()
+                for index in range(4):
+                    model.register_parameter(f"p{index}", nn.Parameter(torch.ones(262145, device="cuda")))
+                offload_to_pinned_cpu(model)
+            stream.synchronize()
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(5_000_000)
+                model.to("cuda", non_blocking=True)
+                outputs = [param.detach() for param in model.parameters()]
+                del model
+            # Likewise, CPU slabs must not be reused while H2D still reads them.
+            pressure = allocate_pinned_like(shapes)
+            for tensor in pressure:
+                tensor.fill_(-9)
+            stream.synchronize()
+            assert all(torch.all(tensor == 1).item() for tensor in outputs)
+
+    def test_sparse_and_differentiable_buffers(self) -> None:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        model = TinyModel("cuda")
+        source = torch.ones(3, device="cuda", requires_grad=True)
+        model.register_buffer("differentiable", source)
+        model.register_buffer("sparse", torch.eye(3, device="cuda").to_sparse())
+        model.to_device("cpu")
+        assert model.sparse.layout == torch.sparse_coo
+        torch.testing.assert_close(model.sparse.to_dense(), torch.eye(3))
+        model.differentiable.sum().backward()
+        torch.testing.assert_close(source.grad, torch.ones(3, device="cuda"))
+
     def test_fsdp_padded_backing_identity_and_training(self, tmp_path: Path) -> None:
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
         if "RANK" in os.environ:
@@ -104,8 +154,9 @@ class TestModelOffloadGPU:
                 reference(inputs).sum().backward()
                 optimizer.step()
                 expected.step()
-                optimizer.zero_grad(set_to_none=True)
-                expected.zero_grad(set_to_none=True)
+                gradients = {
+                    name: _local(param.grad).detach().cpu().clone() for name, param in model.named_parameters()
+                }
                 snapshot = {name: _local(param).detach().cpu().clone() for name, param in model.named_parameters()}
                 model.to_device("cpu")
                 assert {name: id(param) for name, param in model.named_parameters()} == identities
@@ -114,6 +165,7 @@ class TestModelOffloadGPU:
                 )
                 for name, param in model.named_parameters():
                     torch.testing.assert_close(_local(param), snapshot[name])
+                    torch.testing.assert_close(_local(param.grad), gradients[name])
                     if _local(param).numel():
                         assert _local(param).is_pinned()
                 backings = []
@@ -128,7 +180,17 @@ class TestModelOffloadGPU:
                         )
                         backings.append(backing)
                 assert len({tensor.untyped_storage().data_ptr() for tensor in backings}) == 1
+                checkpoint = tmp_path / f"rank-{dist.get_rank()}.pt"
+                torch.save(model.state_dict(), checkpoint)
+                restored = torch.load(checkpoint, weights_only=False)
+                for name, param in model.named_parameters():
+                    torch.testing.assert_close(_local(restored[name]), snapshot[name])
+                    assert restored[name].shape == param.shape
+                    assert restored[name].placements == param.placements
+                del restored, backings
                 model.to_device("cuda")
+                optimizer.zero_grad(set_to_none=True)
+                expected.zero_grad(set_to_none=True)
             torch.testing.assert_close(model(inputs), reference(inputs))
         finally:
             dist.destroy_process_group()
