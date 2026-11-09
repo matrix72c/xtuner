@@ -66,8 +66,7 @@ class TestQwen3VLForwardHead:
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FSDP is required")
-    @pytest.mark.parametrize("value_head", [False, True])
-    def test_no_loss_with_independently_sharded_head(self, value_head: bool) -> None:
+    def test_no_loss_with_independently_sharded_head(self) -> None:
         """Run under torchrun with two or more ranks; no model assets required."""
         import os
 
@@ -82,15 +81,17 @@ class TestQwen3VLForwardHead:
         try:
             torch.manual_seed(42)
             mesh = init_device_mesh("cuda", (dist.get_world_size(),))
-            head = (ValueHead(8) if value_head else LMHead(8, 16)).cuda()
-            model = _ForwardHarness(head).cuda()
-            hidden_states = torch.randn(2, 3, 8, device="cuda")
-            expected = F.linear(hidden_states, head.weight).float().detach()
-            fully_shard(head, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
-            fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
-            for _ in range(2):
-                with torch.no_grad():
-                    actual = model(seq_ctx=_sequence(hidden_states), loss_ctx=None).logits
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            # Share one process group: destroying/recreating NCCL groups between
+            # parametrized pytest cases is not synchronized across torchrun ranks.
+            for head in (LMHead(8, 16).cuda(), ValueHead(8).cuda()):
+                model = _ForwardHarness(head).cuda()
+                hidden_states = torch.randn(2, 3, 8, device="cuda")
+                expected = F.linear(hidden_states, head.weight, head.bias).float().detach()
+                fully_shard(head, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
+                fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=MixedPrecisionPolicy())
+                for _ in range(2):
+                    with torch.no_grad():
+                        actual = model(seq_ctx=_sequence(hidden_states), loss_ctx=None).logits
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         finally:
             dist.destroy_process_group()
