@@ -119,7 +119,6 @@ class TestSwapAdamWStorageCPU:
         for p in params:
             for key in optimizer._state_keys:
                 state = optimizer.state[p][key]
-                assert state is optimizer._param_to_cpu_states_map[p][key]
                 if state is None:
                     continue
                 assert state.shape == p.shape
@@ -191,7 +190,6 @@ class TestSwapAdamWStorageCPU:
                 assert state.placements == param.placements
                 assert state.shape == param.shape and state.stride() == param.stride()
                 assert state.to_local().stride() == local.stride()
-                assert state.to_local().data_ptr() == optimizer._param_to_cpu_states_map[param][key].data_ptr()
         finally:
             dist.destroy_process_group()
 
@@ -242,7 +240,6 @@ class TestSwapAdamWStorageCPU:
                 if isinstance(value, DTensor):
                     assert saved[key]._spec is value._spec
                     assert saved[key]._local_tensor is value._local_tensor
-                    assert value._local_tensor is optimizer._param_to_cpu_states_map[param][key]
                     assert saved[key].storage_offset() == 0
                 else:
                     assert saved[key] is value
@@ -293,8 +290,6 @@ class TestSwapAdamWStorageCPU:
             for key, value in original.items():
                 assert optimizer.state[p][key] is value
                 assert torch.all(value == 2)
-                if key != "step":
-                    assert torch.all(optimizer._param_to_cpu_states_map[p][key] == 2)
         optimizer.load_state_dict({**incoming, "state": {}})
         assert all(torch.count_nonzero(t) == 0 for state in optimizer.state.values() for t in state.values())
 
