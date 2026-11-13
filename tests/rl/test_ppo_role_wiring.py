@@ -33,11 +33,11 @@ from xtuner.v1.loss.utils import sp_split
 from xtuner.v1.model.base import HeadConfig
 from xtuner.v1.model.dense.qwen3 import Qwen3Dense0P6BConfig
 from xtuner.v1.rl.advantage import (
+    DecoupledGAEAdvantageConfig,
+    DecoupledGAEEstimator,
     GAEAdvantageConfig,
     GAEEstimator,
     GRPOAdvantageConfig,
-    DecoupledGAEAdvantageConfig,
-    DecoupledGAEEstimator,
     TokenAdvantageEstimator,
     TokenStats,
     session_token_targets,
@@ -172,7 +172,6 @@ class TestGAEAdvantageEstimation(unittest.TestCase):
         # TD(1) 下每条轨迹的回报收敛到终局 reward：轨迹 1 -> 1.0，轨迹 2 -> 0.0。
         torch.testing.assert_close(critic_returns, torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0]))
 
-
         # 行为：session 作用域下 reward 落在会话最后一个分段末尾
         estimator = GAEAdvantageConfig(
             gae_lambda=0.0,
@@ -285,8 +284,9 @@ class TestResidencyAndGuards(unittest.TestCase):
     """worker 跨角色驻留与 role 侧 RPC 守卫。"""
 
     def setUp(self) -> None:
-        cache_patch = patch("xtuner.v1.rl.trainer.worker.DEVICE_MODULE.empty_cache")
-        self.empty_cache = cache_patch.start()
+        # Fake the accelerator boundary, including on CPU-only test hosts.
+        cache_patch = patch("xtuner.v1.rl.trainer.worker.DEVICE_MODULE")
+        self.empty_cache = cache_patch.start().empty_cache
         self.addCleanup(cache_patch.stop)
 
     def _worker(self):
@@ -580,6 +580,7 @@ class TestControllerPPOGuards(unittest.TestCase):
 class TestCheckpointOrchestration(unittest.TestCase):
     """checkpoint 保存/恢复的角色编排（public: save/resume/save_hf）。"""
 
+    @patch("xtuner.v1.rl.trainer.worker.DEVICE_MODULE", new=MagicMock())
     def test_checkpoint_cover_every_configured_role(self):
         # 行为：save/resume/save_hf 以 role-first 目录覆盖每个已配置角色及 SFT 状态
         worker = TrainingWorker.__new__(TrainingWorker)
