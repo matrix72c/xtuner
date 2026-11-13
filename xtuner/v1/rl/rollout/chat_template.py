@@ -17,7 +17,9 @@ def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
     token ids, labels, or raw rollout artifacts used for training.
 
     ``tool_calls[].function.arguments`` strings are parsed to dicts so the
-    template's ``tojson`` filter sees a real object.
+    template's ``tojson`` filter sees a real object. Object keys are sorted
+    recursively so clients can reorder arguments without changing trace keys;
+    array order and the original sampled token IDs remain unchanged.
     """
 
     messages = copy.deepcopy(messages)
@@ -31,7 +33,7 @@ def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
             function = tool_call.get("function")
             if not isinstance(function, dict) or "arguments" not in function:
                 continue
-            function["arguments"] = canonicalize_tool_arguments(function["arguments"])
+            function["arguments"] = _ordered_json(canonicalize_tool_arguments(function["arguments"]))
     return messages
 
 
@@ -53,6 +55,14 @@ def canonicalize_tool_arguments(arguments: Any) -> dict[str, Any]:
     if isinstance(parsed, dict):
         return parsed
     return {_RAW_ARGUMENTS_KEY: arguments}
+
+
+def _ordered_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _ordered_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_ordered_json(item) for item in value]
+    return value
 
 
 def _loads_partial_json_object(raw: str) -> dict[str, Any] | None:

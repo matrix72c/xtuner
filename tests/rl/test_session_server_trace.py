@@ -1,19 +1,24 @@
+import asyncio
 import copy
 import json
+import string
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from aiohttp import ClientConnectionResetError, web
 from aiohttp.test_utils import TestClient, TestServer
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Split
 
 from transformers import PreTrainedTokenizerFast
 from xtuner.v1.rl.rollout import session_server as session_server_module
 from xtuner.v1.rl.rollout.chat_template import canonicalize_messages_for_chat_template
 from xtuner.v1.rl.rollout.session_server import SessionServer
-from xtuner.v1.rl.rollout.trace_store import Trie
+from xtuner.v1.rl.rollout.trace_store import RolloutTraceStore, Trie
 
 
 class TestSessionServerTraceHandling(unittest.IsolatedAsyncioTestCase):
@@ -498,6 +503,158 @@ class TestAnthropicToolTrace(unittest.IsolatedAsyncioTestCase):
                     tokenize=False,
                 ).rstrip()
                 self.assertNotEqual(trie.search(different_key, filter_none=True)[0], different_key)
+
+
+class TestToolArgumentOrder:
+    @pytest.mark.parametrize("as_json", [False, True], ids=["dict", "json"])
+    def test_canonical_view_sorts_objects_not_arrays(self, as_json: bool) -> None:
+        arguments = {"z": [{"z": 2, "a": 1}, {"d": 4, "c": 3}], "a": {"y": 6, "b": 5}}
+        messages = [self._assistant(json.dumps(arguments) if as_json else arguments)]
+        original = copy.deepcopy(messages)
+        canonical = canonicalize_messages_for_chat_template(messages)
+        result = canonical[0]["tool_calls"][0]["function"]["arguments"]
+        assert list(result) == ["a", "z"]
+        assert list(result["a"]) == ["b", "y"]
+        assert [list(item) for item in result["z"]] == [["a", "z"], ["c", "d"]]
+        assert result == arguments  # Including the original array element order and values.
+        assert json.dumps(messages) == json.dumps(original)
+        result["z"][0]["a"] = 99
+        assert json.dumps(messages) == json.dumps(original)
+
+    @pytest.mark.parametrize("check", ["forward", "export"])
+    @pytest.mark.parametrize(
+        "fmt,response_json,request_json",
+        [
+            (session_server_module.FMT_OPENAI, False, False),
+            (session_server_module.FMT_OPENAI, False, True),
+            (session_server_module.FMT_OPENAI, True, False),
+            (session_server_module.FMT_OPENAI, True, True),
+            (session_server_module.FMT_ANTHROPIC, False, False),
+        ],
+        ids=["openai-dict-dict", "openai-dict-json", "openai-json-dict", "openai-json-json", "anthropic"],
+    )
+    def test_reordered_arguments_preserve_sampled_trace(
+        self, fmt: str, response_json: bool, request_json: bool, check: str
+    ) -> None:
+        asyncio.run(self._check_trace(fmt, response_json, request_json, check))
+
+    async def _check_trace(self, fmt: str, response_json: bool, request_json: bool, check: str) -> None:
+        # Real HF rendering/tokenization; distinct character IDs make re-encoding
+        # observably different from reusing sampled IDs. No model download or Ray runtime.
+        backend = Tokenizer(WordLevel({c: i for i, c in enumerate(["[UNK]", *string.printable])}, unk_token="[UNK]"))
+        backend.pre_tokenizer = Split("", behavior="isolated")
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            chat_template=(
+                "{% for message in messages %}{{ message['role'] }}:{{ message.get('content') or '' }}"
+                "{% for call in message.get('tool_calls', []) %}{{ call['function'] | tojson }}{% endfor %}"
+                "<eos>{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}"
+            ),
+        )
+        store = RolloutTraceStore.__ray_metadata__.modified_class()
+        server = SessionServer.__new__(SessionServer)
+        server.tokenizer = tokenizer
+        server.stop_word = "<eos>"
+        server.enable_return_routed_experts = False
+        server.store = SimpleNamespace(
+            search=SimpleNamespace(remote=AsyncMock(side_effect=store.search)),
+            insert=SimpleNamespace(remote=AsyncMock(side_effect=store.insert)),
+        )
+        arguments = {"z": [{"z": 2, "a": 1}, {"d": 4, "c": 3}], "a": {"y": 6, "b": 5}}
+        reordered = {"a": {"b": 5, "y": 6}, "z": [{"a": 1, "z": 2}, {"c": 3, "d": 4}]}
+        request = {
+            "model": "test-model",
+            "max_tokens": 256,
+            "session_id": "argument-order",
+            "messages": [{"role": "user", "content": "Run the tool"}],
+        }
+        initial = copy.deepcopy(request)
+        first_forwarded = await server.on_request(request, fmt)
+        old_prompt = tokenizer.apply_chat_template(request["messages"], add_generation_prompt=True, tokenize=False)
+        # Simulate sampled output in the original, noncanonical order. The trace
+        # key may be canonicalized, but these exact IDs must remain authoritative.
+        raw_full = tokenizer.apply_chat_template(
+            [*request["messages"], self._assistant(arguments)], add_generation_prompt=False, tokenize=False
+        )
+        sampled_ids = tokenizer.encode(raw_full[len(old_prompt) :], add_special_tokens=False)
+        sampled_logprobs = [-0.01 * (i + 1) for i in range(len(sampled_ids))]
+        extensions = {"output_ids": sampled_ids, "output_token_logprobs": list(zip(sampled_logprobs, sampled_ids))}
+        if fmt == session_server_module.FMT_ANTHROPIC:
+            assistant = {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_1", "name": "Run", "input": arguments}],
+            }
+            response = {"content": assistant["content"], **extensions}
+            echoed = copy.deepcopy(assistant)
+            echoed["content"][0]["input"] = reordered
+            tool_result = {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "done"}],
+            }
+        else:
+            assistant = self._assistant(json.dumps(arguments) if response_json else arguments)
+            response = {"choices": [{"message": assistant, **extensions}]}
+            echoed = self._assistant(json.dumps(reordered) if request_json else reordered)
+            tool_result = {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+        original_response = copy.deepcopy(response)
+        await server.on_response(response, fmt, request)
+        followup = {**request, "messages": [*request["messages"], echoed, tool_result]}
+        original_followup = copy.deepcopy(followup)
+        forwarded = await server.on_request(followup, fmt)
+        assert json.dumps(request) == json.dumps(initial)
+        assert json.dumps(response) == json.dumps(original_response)
+        assert json.dumps(followup) == json.dumps(original_followup)
+
+        # The exporter consumes the agent's OpenAI-shaped recorded transcript.
+        recorded = [*initial["messages"], self._assistant(json.dumps(reordered) if request_json else reordered)]
+        recorded_before = copy.deepcopy(recorded)
+        lookup_key = tokenizer.apply_chat_template(
+            canonicalize_messages_for_chat_template(recorded), add_generation_prompt=False, tokenize=False
+        ).rstrip()
+        assert json.dumps(recorded) == json.dumps(recorded_before)
+        canonical_ids = tokenizer.encode(lookup_key[len(old_prompt) :], add_special_tokens=False)
+        assert canonical_ids != sampled_ids  # Do not silently train on canonical re-tokenization.
+
+        # Value changes and array permutations must never reuse the entire tool turn.
+        changed_value = copy.deepcopy(reordered)
+        changed_value["a"]["b"] = 99
+        changed_array = copy.deepcopy(reordered)
+        changed_array["z"].reverse()
+        for changed in (changed_value, changed_array):
+            changed_key = tokenizer.apply_chat_template(
+                canonicalize_messages_for_chat_template([*initial["messages"], self._assistant(changed)]),
+                add_generation_prompt=False,
+                tokenize=False,
+            ).rstrip()
+            assert store.search(request["session_id"], changed_key, filter_none=True)[0] != changed_key
+            with pytest.raises(ValueError, match="Prompt text does not match"):
+                store.export_training_trace(request["session_id"], changed_key)
+
+        if check == "forward":
+            # Inspect the exact input_ids sent to the backend, not only a string hit.
+            prompt_key = server.store.search.remote.await_args.args[1]
+            assert prompt_key.startswith(lookup_key)
+            tail_ids = tokenizer.encode(prompt_key[len(lookup_key) :], add_special_tokens=False)
+            assert forwarded["input_ids"] == first_forwarded["input_ids"] + sampled_ids + tail_ids
+            matched, nodes = store.search(request["session_id"], prompt_key, filter_none=True)
+            assert matched == lookup_key
+            assert nodes[-1].value.token_ids == sampled_ids
+            assert nodes[-1].value.labels == sampled_ids
+            assert nodes[-1].value.logprobs == sampled_logprobs
+        trace = store.export_training_trace(request["session_id"], lookup_key)
+        assert trace["input_ids"] == first_forwarded["input_ids"] + sampled_ids
+        assert trace["labels"] == [-100] * len(first_forwarded["input_ids"]) + sampled_ids
+        assert trace["logprobs"] == [0.0] * len(first_forwarded["input_ids"]) + sampled_logprobs
+        assert trace["response_ids"] == sampled_ids
+        assert trace["tool_call_count"] == 1
+
+    @staticmethod
+    def _assistant(arguments: Any) -> dict:
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Run", "arguments": arguments}}],
+        }
 
 
 if __name__ == "__main__":
