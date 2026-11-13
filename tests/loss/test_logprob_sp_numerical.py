@@ -65,7 +65,7 @@ def _check(mesh: DeviceMesh, device: torch.device) -> None:
         expected = _oracle(padded_hidden, head, bias, padded_labels)
         contexts = []
         for mode in ("eager", "chunk"):
-            ctx = LogProbConfig(mode=mode, chunk_size=2).build(data, sp_mesh=mesh)
+            ctx = LogProbConfig(mode=mode, chunk_size=2).build(data, sp_mesh=mesh, device=device)
             assert ctx is not None
             torch.testing.assert_close(ctx.loss_kwargs.shifted_labels, expected_labels, rtol=0, atol=0)
             actual, _ = ctx.forward(local_hidden, head, bias)
@@ -79,7 +79,7 @@ def _check(mesh: DeviceMesh, device: torch.device) -> None:
             for before, after in zip(contexts, batched):
                 assert before is after and after.batch_size == 2
                 torch.testing.assert_close(after.loss_kwargs.shifted_labels, expected_labels, rtol=0, atol=0)
-        local_ctx = LogProbConfig().build({"shifted_labels": expected_labels})
+        local_ctx = LogProbConfig().build({"shifted_labels": expected_labels}, device=device)
         assert local_ctx is not None
         torch.testing.assert_close(local_ctx.loss_kwargs.shifted_labels, expected_labels, rtol=0, atol=0)
         torch.testing.assert_close(data["shifted_labels"], source, rtol=0, atol=0)
