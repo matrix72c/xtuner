@@ -12,7 +12,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from xtuner.v1.rl.agent_loop import (
     AgentLoop,
@@ -123,10 +123,12 @@ class TestRouterCollectMetrics(unittest.IsolatedAsyncioTestCase):
 
 class TestActorDelegation(unittest.IsolatedAsyncioTestCase):
     async def test_delegates_to_inner_loop(self):
-        actor = object.__new__(AgentLoopActor)
-        actor.agent_loop = _CountingLoop()
-        actor.agent_loop._pending["episodes_finished"] = 1.0
-        self.assertEqual(await AgentLoopActor.collect_metrics(actor), {"episodes_finished": 1.0})
+        loop = _CountingLoop()
+        loop._pending["episodes_finished"] = 1.0
+        config = MagicMock()
+        config.build_local.return_value = loop
+        actor = AgentLoopActor(config, MagicMock())
+        self.assertEqual(await actor.collect_metrics(), {"episodes_finished": 1.0})
 
 
 class TestCollectAgentLoopMetricsDispatch(unittest.IsolatedAsyncioTestCase):
