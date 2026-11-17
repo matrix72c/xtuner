@@ -1,5 +1,6 @@
 """RolloutTraceStore 的行为测试。
 
+TestDeepTrie —— 超过递归上限的长会话 trie 的 keys/release 与部分释放行为
 TestRolloutTraceCleanup —— session 释放与 ObjectRef 清理行为
 TestRolloutTraceStore —— store actor 的 session 生命周期与引用递归释放
 TestExportPartialTrainingTrace —— export_partial_training_trace 的部分导出行为
@@ -31,10 +32,52 @@ from xtuner.v1.rl.rollout import trace_store as trace_store_module
 from xtuner.v1.rl.rollout.trace_store import (
     RolloutTraceStore,
     TokenizedSegment,
+    TreeNode,
+    Trie,
     get_existing_store,
     release_and_discard_rollout_groups,
     release_existing_sessions,
 )
+
+
+def _nodes(trie: Trie) -> list[TreeNode]:
+    nodes, stack = [], [trie.root]
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        stack.extend(node.children.values())
+    return nodes
+
+
+class TestDeepTrie(unittest.TestCase):
+    def test_long_conversation_keys_and_release(self) -> None:
+        trie = Trie()
+        count = 1600
+        for index in range(1, count + 1):
+            trie.insert("x" * index, index)
+        self.assertEqual(trie.keys(), ["x" * index for index in range(1, count + 1)])
+        nodes = _nodes(trie)
+        trie.release()
+        self.assertTrue(all(node.value is None and not node.children for node in nodes))
+        self.assertEqual(trie.keys(), [])
+        trie.release()
+
+    def test_partial_release_preserves_branch_values_and_key_order(self) -> None:
+        trie = Trie()
+        self.assertEqual(trie.keys(), [])
+        trie.release()
+        for key in ("z", "", "a", "ab", "abc", "ax"):
+            trie.insert(key, key)
+        self.assertEqual(trie.keys(), ["", "z", "a", "ab", "abc", "ax"])
+        trie.release("ab")
+        self.assertEqual(trie.keys(), ["", "z", "a", "abc", "ax"])
+        trie.release("abc")
+        self.assertEqual(trie.keys(), ["", "z", "a", "ax"])
+        self.assertNotIn("b", trie.root.children["a"].children)
+        trie.release()
+        self.assertEqual(trie.keys(), [])
+        trie.insert("new", "new")
+        self.assertEqual(trie.keys(), ["new"])
 
 
 class TestRolloutTraceCleanup(unittest.TestCase):

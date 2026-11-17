@@ -216,13 +216,12 @@ class Trie:
         """Get all keys (i.e., strings) stored in the Trie."""
         result = []
 
-        def _collect(node: TreeNode, path: List[str]):
+        stack: List[Tuple[TreeNode, str]] = [(self.root, "")]
+        while stack:
+            node, path = stack.pop()
             if node.value is not None:
-                result.append("".join(path))
-            for token, child in node.children.items():
-                _collect(child, path + [token])
-
-        _collect(self.root, [])
+                result.append(path)
+            stack.extend((child, path + token) for token, child in reversed(list(node.children.items())))
         return result
 
     def insert(self, key: str, value: Any) -> None:
@@ -297,15 +296,16 @@ class Trie:
                 If None, releases the entire tree.
         """
 
-        def _free_subtree(node: TreeNode):
-            for child in node.children.values():
-                _free_subtree(child)
-            if node.value is not None:
-                node.value = None
-            node.children.clear()
-
         if key is None:
-            _free_subtree(self.root)
+            stack = [(self.root, False)]
+            while stack:
+                node, visited = stack.pop()
+                if visited:
+                    node.value = None
+                    node.children.clear()
+                else:
+                    stack.append((node, True))
+                    stack.extend((child, False) for child in reversed(list(node.children.values())))
             return
 
         node = self.root
