@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
+import requests
 
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.agent_loop import AgentLoopConfig
@@ -35,7 +36,7 @@ from xtuner.v1.rl.rollout.worker_registry import (
     WorkerLifecycleState,
     WorkerSnapshot,
 )
-from xtuner.v1.rl.utils.misc import delete_from_routedapiproxy
+from xtuner.v1.rl.utils.misc import delete_from_routedapiproxy, register_to_routedapiproxy
 from xtuner.v1.rl.weight_update.data import RolloutWeightUpdateInfo
 from xtuner.v1.train.rl_trainer import BaseRLTrainer, _agent_loop_manager_requires_rollout_proxy
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
@@ -625,7 +626,7 @@ class TestRolloutProxyManager(unittest.TestCase):
 
 class TestRoutedApiProxyUtils(unittest.TestCase):
     def test_delete_from_routedapiproxy_includes_api_base_when_provided(self):
-        response = MagicMock()
+        response = MagicMock(status_code=200)
         response.json.return_value = {"ok": True}
 
         with patch("xtuner.v1.rl.utils.misc.requests.post", return_value=response) as post:
@@ -638,6 +639,48 @@ class TestRoutedApiProxyUtils(unittest.TestCase):
             {"model_name": "test-model", "api_base": "http://session-0"},
         )
         response.raise_for_status.assert_called_once_with()
+
+    def test_register_retries_server_errors_then_succeeds(self):
+        failed = MagicMock(status_code=500, text="busy")
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"code": 0}
+
+        with (
+            patch("xtuner.v1.rl.utils.misc.requests.post", side_effect=[failed, failed, ok]) as post,
+            patch("xtuner.v1.rl.utils.misc.time.sleep") as sleep,
+        ):
+            result = register_to_routedapiproxy("http://proxy-admin", "test-model", "http://session-0")
+
+        self.assertEqual(result, {"code": 0})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1.0, 2.0])
+
+    def test_register_reports_body_after_exhausting_retries(self):
+        failed = requests.Response()
+        failed.status_code = 500
+        failed._content = b"router exploded"
+        failed.url = "http://proxy-admin/v1/models/new"
+
+        with (
+            patch("xtuner.v1.rl.utils.misc.requests.post", return_value=failed) as post,
+            patch("xtuner.v1.rl.utils.misc.time.sleep"),
+        ):
+            with self.assertRaisesRegex(requests.HTTPError, "router exploded"):
+                register_to_routedapiproxy("http://proxy-admin", "test-model", "http://session-0")
+
+        self.assertEqual(post.call_count, 5)
+
+    def test_register_does_not_retry_client_errors(self):
+        failed = requests.Response()
+        failed.status_code = 400
+        failed._content = b"bad request"
+        failed.url = "http://proxy-admin/v1/models/new"
+
+        with patch("xtuner.v1.rl.utils.misc.requests.post", return_value=failed) as post:
+            with self.assertRaisesRegex(requests.HTTPError, "bad request"):
+                register_to_routedapiproxy("http://proxy-admin", "test-model", "http://session-0")
+
+        post.assert_called_once()
 
 
 class TestRolloutWorkerRegistry(unittest.TestCase):
@@ -1271,12 +1314,8 @@ class TestRolloutHealthManager(unittest.TestCase):
             rollout_controller=MagicMock(),
             rollout_config=SimpleNamespace(weight_transport_type="checkpoint_engine"),
         )
-        manager._pending_rollout_weight_update_stop_event = SimpleNamespace(
-            wait=MagicMock(side_effect=(False, True))
-        )
-        manager._rollout_resources_available = SimpleNamespace(
-            is_set=MagicMock(side_effect=(True, False))
-        )
+        manager._pending_rollout_weight_update_stop_event = SimpleNamespace(wait=MagicMock(side_effect=(False, True)))
+        manager._rollout_resources_available = SimpleNamespace(is_set=MagicMock(side_effect=(True, False)))
         manager._rollout_weight_update_lock = SimpleNamespace(
             acquire=MagicMock(return_value=True),
             release=MagicMock(),
@@ -1659,6 +1698,7 @@ class TestRolloutHealthManager(unittest.TestCase):
         self.assertEqual(actor.check_health.calls, [()])
         self.assertEqual(actor.offload.calls, [()])
         self.assertEqual(actor.restore_skip_load_weights.calls, [()])
+
 
 class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
     async def test_preprocess_and_postprocess_preserve_response_prefix(self):

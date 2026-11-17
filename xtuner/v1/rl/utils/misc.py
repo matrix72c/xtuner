@@ -258,6 +258,44 @@ def get_eos_token(model_path: str) -> int | List[int]:
     return eos_token_id
 
 
+ROUTEDAPIPROXY_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
+
+
+def _post_routedapiproxy(url: str, payload: dict, *, timeout: float) -> requests.Response:
+    """POST to the routed API proxy admin API, retrying transient failures.
+
+    Registration and deletion are idempotent on the proxy (re-adding an existing api_base answers "already exists"),
+    so connection errors, timeouts and 5xx responses are retried with backoff. The final error carries the response
+    body, which ``raise_for_status`` alone drops.
+    """
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    for attempt, delay in enumerate((*ROUTEDAPIPROXY_RETRY_DELAYS, None), start=1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if delay is None:
+                raise
+            get_logger().warning(f"Routed API proxy {url} attempt {attempt} failed: {exc!r}; retrying in {delay}s")
+            time.sleep(delay)
+            continue
+        if resp.status_code >= 500 and delay is not None:
+            get_logger().warning(
+                f"Routed API proxy {url} attempt {attempt} returned {resp.status_code}: {resp.text[:500]!r}; "
+                f"retrying in {delay}s"
+            )
+            time.sleep(delay)
+            continue
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            raise requests.HTTPError(f"{exc}; body: {resp.text[:1000]!r}", response=resp) from exc
+        return resp
+    raise AssertionError("unreachable")
+
+
 def register_to_routedapiproxy(admin_url: str, model_name: str, api_server_url: str) -> dict:
     url = f"{admin_url.rstrip('/')}/v1/models/new"
     payload = {
@@ -265,13 +303,7 @@ def register_to_routedapiproxy(admin_url: str, model_name: str, api_server_url: 
         "api_key": "sk-admin",
         "api_base": api_server_url,
     }
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(url, json=payload, headers=headers, timeout=180)
-    resp.raise_for_status()
-    return resp.json()
+    return _post_routedapiproxy(url, payload, timeout=180).json()
 
 
 def delete_from_routedapiproxy(admin_url: str, model_name: str, api_server_url: str | None = None) -> None:
@@ -281,12 +313,7 @@ def delete_from_routedapiproxy(admin_url: str, model_name: str, api_server_url: 
     }
     if api_server_url is not None:
         payload["api_base"] = api_server_url
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(url, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
+    _post_routedapiproxy(url, payload, timeout=30)
 
 
 TIMEOUT = 120
