@@ -366,6 +366,22 @@ class TestBatchLifecycle(unittest.TestCase):
         self.assertIsNone(traced.routed_experts)
         self.assertIsNone(plain.routed_experts)
 
+    def test_train_one_batch_releases_batch_when_fit_fails(self):
+        trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+        trainer._meta = SimpleNamespace(latest_exp=SimpleNamespace(exp_dir=Path(self.id())))
+        trainer.logger = MagicMock()
+        trainer._train_worker_cfg = SimpleNamespace(pack_max_length=4)
+        trainer._prepare_train_batch = MagicMock(return_value=(0, 0))
+        trainer._save_trajectories = MagicMock()
+        trainer._release_train_batch_resources = MagicMock()
+        trainer.train_controller = SimpleNamespace(fit=MagicMock(side_effect=RuntimeError("fit failed")))
+        train_batch = [[canonical_state(1)]]
+
+        with patch.object(Path, "mkdir"), self.assertRaisesRegex(RuntimeError, "fit failed"):
+            trainer._train_one_batch(train_batch, train_step=1, step_timer_dict={})
+
+        trainer._release_train_batch_resources.assert_called_once_with(train_batch)
+
 
 class TestFailedBatchCleanup:
     @staticmethod
