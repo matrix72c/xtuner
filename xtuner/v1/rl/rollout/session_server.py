@@ -1,5 +1,7 @@
 import copy
 import json
+import re
+import time
 from functools import reduce
 from http import HTTPStatus
 from operator import add
@@ -7,12 +9,13 @@ from typing import Any, List, Optional
 
 import numpy as np
 import ray
-from aiohttp import ClientConnectionResetError, ClientSession, ClientTimeout, web
+from aiohttp import ClientConnectionResetError, ClientSession, ClientTimeout, ConnectionTimeoutError, TraceConfig, web
 
 from transformers import AutoTokenizer
 from xtuner.v1.utils import get_logger
 
 from .chat_template import canonicalize_messages_for_chat_template
+from .request_gate import RequestGate, RequestLease, SettlementReceipt
 from .trace_store import TokenizedSegment, get_store
 
 
@@ -20,7 +23,7 @@ FMT_OPENAI = "openai"
 FMT_ANTHROPIC = "anthropic"
 
 # Fields the SessionServer consumes locally and never forwards upstream.
-_SESSION_SERVER_ONLY_KEYS = {"session_id"}
+_SESSION_SERVER_ONLY_KEYS = {"session_id", "_xt_request_id", "_xt_model_step"}
 
 
 def _normalize_path(req_path: str) -> str:
@@ -43,6 +46,35 @@ def _detect_format(req_path: str) -> str:
 
 def _is_error_payload(payload: dict) -> bool:
     return payload.get("error") is not None or payload.get("type") == "error" or payload.get("object") == "error"
+
+
+def _is_lmdeploy_context_rejection(status: int, body: bytes) -> bool:
+    """Recognize the pinned LMDeploy's input check before engine generation.
+
+    A finished HTTP error alone does not prove that backend execution ended.
+    LMDeploy bc2c8da's AsyncEngine rejects input_len >= session_len before
+    submitting generation. Its OpenAI response has no stable machine error code,
+    so match that specific payload conservatively; unknown errors stay unsafe.
+    """
+    if status != HTTPStatus.BAD_REQUEST:
+        return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict) or (
+        payload.get("object") != "error"
+        or payload.get("type") != "invalid_request_error"
+        or payload.get("code") != 400
+        or "choices" in payload
+        or not isinstance(payload.get("message"), str)
+    ):
+        return False
+    match = re.fullmatch(
+        r"Input length \(([0-9]{1,20})\) must be smaller than the model context length \(([0-9]{1,20})\)\.",
+        payload["message"],
+    )
+    return match is not None and int(match[1]) >= int(match[2]) > 0
 
 
 class _UpstreamResponseError(RuntimeError):
@@ -267,6 +299,8 @@ class SessionServer:
         read_bufsize (int): Buffer limit for line reader in ClientSession. Default is 64MB (2**26).
     """
 
+    request_gate: RequestGate | None = None
+
     def __init__(
         self,
         worker_base_url: str,
@@ -276,6 +310,8 @@ class SessionServer:
         request_timeout: float = 1200.0,
         read_bufsize: int = 2**26,
         enable_return_routed_experts: bool = False,
+        turn_resume_wait_timeout: float | None = None,
+        turn_resume_initially_closed: bool = False,
     ):
         self.worker_base_url = worker_base_url.rstrip("/")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -284,6 +320,12 @@ class SessionServer:
         self.request_timeout = request_timeout
         self.read_bufsize = read_bufsize
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.turn_resume_wait_timeout = turn_resume_wait_timeout
+        self.turn_resume_initially_closed = turn_resume_initially_closed
+        self.request_gate = (
+            RequestGate(wait_timeout=turn_resume_wait_timeout, initially_open=not turn_resume_initially_closed)
+            if turn_resume_wait_timeout is not None else None
+        )
         self.store = get_store()
         self.stop_word = self.tokenizer.eos_token or ""
 
@@ -414,6 +456,14 @@ class SessionServer:
             dict: The (possibly trimmed) response — currently unused by the
             caller but kept for symmetry.
         """
+        if orig_req_body.get("_xt_request_id") is not None and (
+            not worker_resp.get("choices")
+            or any(c.get("finish_reason") not in {"stop", "length", "tool_calls"} for c in worker_resp["choices"])
+        ):
+            raise RuntimeError(
+                "Backend returned an unsuccessful generation terminal: "
+                + str([c.get("finish_reason") for c in worker_resp.get("choices", [])])
+            )
         session_id = orig_req_body["session_id"]
 
         if fmt == FMT_ANTHROPIC:
@@ -463,7 +513,6 @@ class SessionServer:
         ).rstrip()
         # Templates such as GLM's do not append tokenizer.eos_token to assistant turns.
         # Rendered text defines cache boundaries; raw output IDs define the training trace.
-        # TODO: 增加每个模型的 stop_word 列表，并用列表匹配endswith xxx
         if not new_prompt.startswith(old_prompt):
             raise RuntimeError("SessionServer response template does not preserve the generation prompt prefix.")
 
@@ -491,8 +540,9 @@ class SessionServer:
             if delta_len > 0:
                 delta_expert = ray.put(raw_routed_expert[prefix_len : prefix_len + delta_len])
             response_expert = ray.put(raw_routed_expert[prefix_len + delta_len :])
-        elif self.enable_return_routed_experts and _bool_request_value(
-            orig_req_body.get("return_routed_experts"), True
+        elif self.enable_return_routed_experts and (
+            orig_req_body.get("_xt_request_id") is not None
+            or _bool_request_value(orig_req_body.get("return_routed_experts"), True)
         ):
             raise RuntimeError(
                 "SessionServer response is missing routed_experts, but enable_return_routed_experts is True."
@@ -507,7 +557,13 @@ class SessionServer:
             await self.store.insert.remote(
                 session_id,
                 key=old_prompt,
-                value=TokenizedSegment(text=delta_text, token_ids=delta_ids, expert_key=delta_expert),
+                value=TokenizedSegment(
+                    text=delta_text,
+                    token_ids=delta_ids,
+                    expert_key=delta_expert,
+                    request_id=orig_req_body.get("_xt_request_id"),
+                    model_step=orig_req_body.get("_xt_model_step"),
+                ),
             )
         await self.store.insert.remote(
             session_id,
@@ -519,6 +575,8 @@ class SessionServer:
                 labels=output_token_ids,
                 expert_key=response_expert,
                 tool_call_count=len(assistant_msg.get("tool_calls") or []),
+                request_id=orig_req_body.get("_xt_request_id"),
+                model_step=orig_req_body.get("_xt_model_step"),
                 length=len(output_token_ids),
             ),
         )
@@ -554,8 +612,40 @@ class SessionServer:
         get_logger().info("SessionServer stopped.")
 
     async def _handle_request(self, request: web.Request) -> web.Response:
+        path = request.match_info["path"]
+        if self.request_gate is None or not _is_generation_endpoint(request.method, path):
+            return await self._forward_request(request)
+        fmt = _detect_format(path)
+        if fmt != FMT_OPENAI:
+            return web.json_response(
+                _error_payload(fmt, "turn-resume supports OpenAI chat completions only", 400), status=400
+            )
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return web.json_response(_error_payload(fmt, "Invalid generation JSON", 400), status=400)
+        if not isinstance(body, dict) or body.get("stream") or not _request_uses_trace_store(body):
+            return web.json_response(
+                _error_payload(fmt, "turn-resume requires nonstream traced generation", 400), status=400
+            )
+        async with self.request_gate.request(str(body["session_id"])) as lease:
+            started = time.perf_counter()
+            try:
+                return await self._forward_request(request, lease)
+            except BaseException as exc:
+                get_logger().error(
+                    f"request_forward_failed id={lease.request_id} exception={type(exc).__name__} "
+                    f"elapsed_s={time.perf_counter() - started:.6f} "
+                    f"settlement_recorded={lease.settlement is not None}"
+                )
+                raise
+
+    async def _forward_request(self, request: web.Request, lease: RequestLease | None = None) -> web.Response:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
+        request_start = time.perf_counter()
+        prepare_s = 0.0
+        trace_s = 0.0
         req_path = request.match_info["path"]
         is_generation_endpoint = _is_generation_endpoint(request.method, req_path)
         fmt = _detect_format(req_path)
@@ -612,6 +702,9 @@ class SessionServer:
                             request_data["tools"] = filtered
                         else:
                             request_data.pop("tools", None)
+                    if lease is not None:
+                        request_data["_xt_request_id"] = lease.request_id
+                        request_data["_xt_model_step"] = lease.model_step
                     orig_req_body = copy.deepcopy(request_data)
 
                     trace_enabled = _request_uses_trace_store(request_data)
@@ -624,13 +717,19 @@ class SessionServer:
                     orig_return_token_ids = _bool_request_value(request_data.get("return_token_ids"), False)
                     orig_return_routed_experts = _bool_request_value(request_data.get("return_routed_experts"), True)
 
+                    prepare_start = time.perf_counter()
                     request_data = await self.on_request(request_data, fmt, trace_enabled=trace_enabled)
+                    prepare_s = time.perf_counter() - prepare_start
                     request_body = json.dumps(request_data).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
             except Exception as exc:
                 message = f"SessionServer request hook failed: {type(exc).__name__}: {exc}"
                 get_logger().error(message)
+                if lease is not None:
+                    # Request preparation failed before any backend send.
+                    get_logger().error(f"request_terminal id={lease.request_id} outcome=not_started")
+                    lease.settlement = SettlementReceipt(True, True, "not_started")
                 return web.json_response(_error_payload(fmt, message), status=500)
 
         trace_active = is_generation_endpoint and trace_enabled
@@ -665,96 +764,137 @@ class SessionServer:
             else None
         )
 
-        timeout = ClientTimeout(total=self.request_timeout, sock_connect=30)
-        async with ClientSession(read_bufsize=self.read_bufsize, timeout=timeout) as client:
-            async with client.request(
-                method=request.method, url=target_url, headers=forward_headers, data=request_body
-            ) as resp:
-                upstream_status = resp.status
-                is_success_response = HTTPStatus.OK <= upstream_status < HTTPStatus.MULTIPLE_CHOICES
-                trace_response = trace_active and is_success_response
-                if is_stream:
-                    response_chunks: list[bytes] = []
-                    response = web.StreamResponse(
-                        status=resp.status,
-                        headers={
-                            k: v
-                            for k, v in resp.headers.items()
-                            if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
-                        },
-                    )
-                    # If the downstream client closes the socket mid-stream
-                    # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
-                    # chunk after the prompt overflowed the session window),
-                    # keep draining the upstream so the trace is still recorded
-                    # in full but stop attempting to write to the closed socket.
-                    try:
-                        await response.prepare(request)
-                    except (ConnectionError, ClientConnectionResetError):
-                        client_alive = False
-                    else:
-                        client_alive = True
-                    skip_blank_after_done = False
-                    async for line in resp.content:
-                        # Only retain chunks when we'll actually need to parse
-                        # them for tracing; evaluate-mode requests skip this
-                        # so memory does not grow with stream length.
-                        if trace_response:
-                            response_chunks.append(line)
+        forward_start = time.perf_counter()
+        # ConnectionTimeoutError is raised by aiohttp while acquiring a connection,
+        # before sending this attempt. Keep a monotonic send latch as redirects or
+        # future transport changes may have already sent an earlier attempt.
+        headers_may_have_been_sent = False
+        trace_configs = []
+        if lease is not None:
+            trace = TraceConfig()
 
-                        if (
-                            is_success_response
-                            and clean_data is not None
-                            and request_data is not None
-                            and line.startswith(b"data: ")
-                            and line.strip() != b"data: [DONE]"
-                        ):
+            async def mark_headers_sent(session, context, params):
+                nonlocal headers_may_have_been_sent
+                headers_may_have_been_sent = True
+
+            trace.on_request_headers_sent.append(mark_headers_sent)
+            trace_configs.append(trace)
+        try:
+            timeout = ClientTimeout(total=self.request_timeout, sock_connect=30)
+            async with ClientSession(read_bufsize=self.read_bufsize, timeout=timeout, trace_configs=trace_configs) as client:
+                async with client.request(
+                    method=request.method, url=target_url, headers=forward_headers, data=request_body
+                ) as resp:
+                    upstream_status = resp.status
+                    is_success_response = HTTPStatus.OK <= upstream_status < HTTPStatus.MULTIPLE_CHOICES
+                    trace_response = trace_active and is_success_response
+                    if is_stream:
+                        response_chunks: list[bytes] = []
+                        response = web.StreamResponse(
+                            status=resp.status,
+                            headers={
+                                k: v
+                                for k, v in resp.headers.items()
+                                if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
+                            },
+                        )
+                        # If the downstream client closes the socket mid-stream
+                        # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
+                        # chunk after the prompt overflowed the session window),
+                        # keep draining the upstream so the trace is still recorded
+                        # in full but stop attempting to write to the closed socket.
+                        try:
+                            await response.prepare(request)
+                        except (ConnectionError, ClientConnectionResetError):
+                            client_alive = False
+                        else:
+                            client_alive = True
+                        skip_blank_after_done = False
+                        async for line in resp.content:
+                            # Only retain chunks when we'll actually need to parse
+                            # them for tracing; evaluate-mode requests skip this
+                            # so memory does not grow with stream length.
+                            if trace_response:
+                                response_chunks.append(line)
+
+                            if (
+                                is_success_response
+                                and clean_data is not None
+                                and request_data is not None
+                                and line.startswith(b"data: ")
+                                and line.strip() != b"data: [DONE]"
+                            ):
+                                try:
+                                    text = line.decode("utf-8")
+                                    data = json.loads(text[6:])
+                                    if isinstance(data, dict) and not _is_error_payload(data) and clean_data(data):
+                                        line = ("data: " + json.dumps(data) + "\n").encode("utf-8")
+                                except Exception:
+                                    pass
+
+                            # Delay [DONE] only while a training trace still needs to be exported.
+                            if trace_response and skip_blank_after_done:
+                                if not line.strip():
+                                    continue
+                                skip_blank_after_done = False
+                            if line.strip() == b"data: [DONE]":
+                                if trace_response:
+                                    skip_blank_after_done = True
+                                    continue
+                            if client_alive:
+                                try:
+                                    await response.write(line)
+                                except (ConnectionError, ClientConnectionResetError):
+                                    client_alive = False
+
+                        raw_response = b"".join(response_chunks) if trace_response else b""
+                    else:
+                        raw_response = await resp.read()
+                        final_raw_response = raw_response
+
+                        if is_success_response and clean_data is not None and request_data is not None:
                             try:
-                                text = line.decode("utf-8")
-                                data = json.loads(text[6:])
-                                if isinstance(data, dict) and not _is_error_payload(data) and clean_data(data):
-                                    line = ("data: " + json.dumps(data) + "\n").encode("utf-8")
+                                parsed = json.loads(raw_response)
+                                if isinstance(parsed, dict) and not _is_error_payload(parsed) and clean_data(parsed):
+                                    final_raw_response = json.dumps(parsed).encode("utf-8")
                             except Exception:
                                 pass
 
-                        # Delay [DONE] only while a training trace still needs to be exported.
-                        if trace_response and skip_blank_after_done:
-                            if not line.strip():
-                                continue
-                            skip_blank_after_done = False
-                        if line.strip() == b"data: [DONE]":
-                            if trace_response:
-                                skip_blank_after_done = True
-                                continue
-                        if client_alive:
-                            try:
-                                await response.write(line)
-                            except (ConnectionError, ClientConnectionResetError):
-                                client_alive = False
+                        response = web.Response(
+                            status=resp.status,
+                            headers={
+                                k: v
+                                for k, v in resp.headers.items()
+                                if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
+                            },
+                            body=final_raw_response,
+                        )
 
-                    raw_response = b"".join(response_chunks) if trace_response else b""
-                else:
-                    raw_response = await resp.read()
-                    final_raw_response = raw_response
+        except ConnectionTimeoutError:
+            if lease is not None and not headers_may_have_been_sent:
+                # A failed, never-sent attempt has no backend generation to drain.
+                # Do not retry or fabricate a successful trace/reward. Preserve
+                # the exception for the caller; release only its unsafe gate lease.
+                lease.settlement = SettlementReceipt(True, True, "not_started_connect_timeout")
+                get_logger().warning(
+                    f"request_terminal id={lease.request_id} outcome=not_started_connect_timeout "
+                    "backend_ended=True request_headers_sent=False"
+                )
+            raise
+        except TimeoutError as exc:
+            # Only HTTP forwarding timeouts qualify. Trace-hook errors, unknown
+            # exceptions and caller cancellation must not be relabelled safe.
+            if lease is not None and lease.settlement is None:
+                if not hasattr(self, "_forward_timeouts"):
+                    self._forward_timeouts = {}
+                self._forward_timeouts[lease.request_id] = dict(
+                    session_id=lease.session_id, epoch=lease.epoch,
+                    headers_sent=headers_may_have_been_sent,
+                    error_type=type(exc).__name__, forwarding_exited=True,
+                )
+            raise
 
-                    if is_success_response and clean_data is not None and request_data is not None:
-                        try:
-                            parsed = json.loads(raw_response)
-                            if isinstance(parsed, dict) and not _is_error_payload(parsed) and clean_data(parsed):
-                                final_raw_response = json.dumps(parsed).encode("utf-8")
-                        except Exception:
-                            pass
-
-                    response = web.Response(
-                        status=resp.status,
-                        headers={
-                            k: v
-                            for k, v in resp.headers.items()
-                            if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
-                        },
-                        body=final_raw_response,
-                    )
-
+        forward_s = time.perf_counter() - forward_start
         # Apply abstract on_response processing
         response_data: Optional[dict] = None
         skip_done = bool(is_stream and not trace_response)
@@ -787,9 +927,48 @@ class SessionServer:
 
             if response_data is not None:
                 try:
+                    trace_start = time.perf_counter()
                     await self.on_response(response_data, fmt, orig_req_body)
+                    trace_s = time.perf_counter() - trace_start
+                    if lease is not None and any(
+                        c.get("finish_reason") not in {"stop", "length", "tool_calls"}
+                        for c in response_data.get("choices", [])
+                    ):
+                        raise RuntimeError("Unsuccessful backend generation terminal")
                 except Exception as exc:
                     session_error_msg = f"SessionServer response hook failed: {type(exc).__name__}: {exc}"
+
+        if lease is not None:
+            complete = (
+                not is_stream
+                and is_success_response
+                and response_data is not None
+                and not _is_error_payload(response_data)
+                and bool(response_data.get("choices"))
+                and all(c.get("finish_reason") is not None for c in response_data["choices"])
+            )
+            terminal = "trace_committed" if complete and not session_error_msg else "failed"
+            # A known pre-generation rejection is a safely ended failed attempt,
+            # not a successful trace and not an ambiguous in-flight request.
+            rejected_before_generation = not is_stream and _is_lmdeploy_context_rejection(
+                upstream_status, raw_response
+            )
+            backend_ended = complete or rejected_before_generation
+            get_logger().info(f"request_terminal id={lease.request_id} outcome={terminal} backend_ended={backend_ended}")
+            if rejected_before_generation:
+                get_logger().info(
+                    f"request_rejected_before_generation id={lease.request_id} reason=context_length_exceeded"
+                )
+            get_logger().info(
+                f"request_timing id={lease.request_id} prepare_s={prepare_s:.6f} "
+                f"forward_s={forward_s:.6f} trace_s={trace_s:.6f} "
+                f"total_s={time.perf_counter() - request_start:.6f}"
+            )
+            lease.settlement = SettlementReceipt(backend_ended, True, terminal)
+            if terminal == "trace_committed":
+                payload = json.loads(response.body)
+                payload["id"] = lease.request_id
+                response.body = json.dumps(payload).encode("utf-8")
 
         if session_error_msg:
             get_logger().error(session_error_msg)
@@ -1127,6 +1306,8 @@ class SessionServerActor:
         port: int,
         request_timeout: float,
         enable_return_routed_experts: bool = False,
+        turn_resume_wait_timeout: float | None = None,
+        turn_resume_initially_closed: bool = False,
     ):
         self.worker_base_url = worker_base_url
         self.tokenizer_path = tokenizer_path
@@ -1134,6 +1315,8 @@ class SessionServerActor:
         self.port = port
         self.request_timeout = request_timeout
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.turn_resume_wait_timeout = turn_resume_wait_timeout
+        self.turn_resume_initially_closed = turn_resume_initially_closed
         self.server: SessionServer | None = None
 
     @property
@@ -1151,9 +1334,83 @@ class SessionServerActor:
             port=self.port,
             request_timeout=self.request_timeout,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            turn_resume_wait_timeout=self.turn_resume_wait_timeout,
+            turn_resume_initially_closed=self.turn_resume_initially_closed,
         )
         await self.server.start()
         return self.server.url
+
+    def _gate(self) -> RequestGate:
+        if self.server is None or self.server.request_gate is None:
+            raise RuntimeError("turn-resume gate is not enabled")
+        return self.server.request_gate
+
+    async def request_status(self):
+        state = self._gate().snapshot()
+        state["known_forward_timeouts"] = sorted(getattr(self.server, "_forward_timeouts", {}))
+        return state
+
+    async def seal_requests(self, epoch: int):
+        await self._gate().seal(epoch)
+
+    async def drain_requests(self, timeout: float):
+        return await self._gate().drain(timeout)
+
+    async def settle_after_backend_sleep(self, epoch: int, receipt: dict):
+        import asyncio
+        from .trace_store import get_existing_store
+        if (self.server is None or receipt.get("epoch") != epoch
+                or receipt.get("backend_url") != self.worker_base_url
+                or receipt.get("level") != 2
+                or receipt.get("native_sleep_returned") is not True
+                or receipt.get("is_sleeping") is not True):
+            raise RuntimeError("Missing or mismatched native backend sleep receipt")
+        gate = self._gate()
+        # Native sleep aborts running requests and fences queued old work by
+        # backend epoch. Wait for their local forwarding coroutines to exit too.
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            state = gate.snapshot()
+            if state["open"] or state["epoch"] != epoch:
+                raise RuntimeError("Recovery entrypoint was not sealed")
+            if set(state["active"]) == set(state["failures"]):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Local HTTP forwarding did not finish after backend sleep")
+            await asyncio.sleep(0.05)
+        ids = set(state["failures"])
+        if not ids:
+            return dict(recovered=[], gate=state)
+        known = getattr(self.server, "_forward_timeouts", {})
+        if not ids.issubset(known) or any(not known[i]["forwarding_exited"] for i in ids):
+            raise RuntimeError("Unknown non-timeout failures remain unsafe")
+        # Whole failed Agent executions are excluded by the existing recipe.
+        # Never retain a failed turn as a successful training trace/reward.
+        sessions = list({known[i]["session_id"] for i in ids})
+        store = get_existing_store()
+        if store is None:
+            raise RuntimeError("Cannot certify trace cleanup without the existing store")
+        await store.release_sessions.remote(sessions)
+        for session_id in sessions:
+            if await store.keys.remote(session_id):
+                raise RuntimeError("Failed Agent trace resources remain live")
+        terminals = getattr(self.server, "_recovery_terminals", {})
+        for request_id in ids:
+            terminals[request_id] = dict(outcome="failed_after_backend_sleep",
+                                        session_id=known[request_id]["session_id"],
+                                        barrier_epoch=epoch, reward_valid=False)
+        self.server._recovery_terminals = terminals
+        result = await gate.settle_after_backend_sleep(epoch, ids)
+        for request_id in ids:
+            del known[request_id]
+        get_logger().warning(f"backend_timeout_recovered epoch={epoch} requests={sorted(ids)}")
+        return dict(recovered=sorted(ids), gate=result, failed_terminals=terminals)
+
+    async def install_request_version(self, epoch: int, model_step: int):
+        await self._gate().install_version(epoch, model_step)
+
+    async def reopen_requests(self, epoch: int):
+        await self._gate().reopen(epoch)
 
     async def stop(self) -> None:
         if self.server is not None:

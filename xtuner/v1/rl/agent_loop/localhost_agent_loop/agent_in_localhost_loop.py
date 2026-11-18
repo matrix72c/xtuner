@@ -277,8 +277,9 @@ class AgentInLocalhostLoop(AgentLoop):
 
         rollout_state.input_ids = data["input_ids"]
         rollout_state.labels = data["labels"]
-        # prompt_ids/response_ids 都取自 trace（会话初始 prompt 段 + 其后的连续后缀），
-        # 恢复 input_ids == prompt_ids + response_ids，不依赖 dataset 侧 prompt_ids。
+        # Unified response_ids convention: the contiguous suffix of input_ids after the prompt
+        # (env-injected tokens included), aligned with response_model_steps for per-token
+        # staleness; also the token count used by rollout throughput logging.
         rollout_state.prompt_ids = list(data["prompt_ids"])
         rollout_state.response_ids = list(data["response_ids"])
         rollout_state.logprobs = data["logprobs"]

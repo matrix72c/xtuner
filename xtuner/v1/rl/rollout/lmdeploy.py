@@ -232,7 +232,19 @@ class LMDeployWorker(RolloutWorker):
 
     def offload(self):
         """Offloads the model weights and KV cache."""
+        if getattr(self, "_timeout_recovery_sleep", False):
+            return "already offloaded by timeout recovery"
         return self._sleep(level=2)
+
+    def sleep_for_timeout_recovery(self, epoch: int):
+        self._sleep(level=2)  # Returns only after native engine/executor drain.
+        response = requests.get(self.server_url + "/is_sleeping", timeout=15)
+        response.raise_for_status()
+        if response.json().get("is_sleeping") is not True:
+            raise RuntimeError("Backend did not confirm sleeping state")
+        self._timeout_recovery_sleep = True
+        return dict(epoch=epoch, backend_url=self.server_url,
+                    level=2, native_sleep_returned=True, is_sleeping=True)
 
     def onload_weights(self):
         """Onloads the model weights by waking up the model."""
@@ -336,6 +348,7 @@ class LMDeployWorker(RolloutWorker):
         data = {"tags": tags}
         response = requests.post(url, headers=headers, params=data, timeout=600)
         assert response.status_code == 200, response.status_code
+        self._timeout_recovery_sleep = False
         return response.text
 
     def _request_server_terminate(self) -> bool:
@@ -434,6 +447,15 @@ class LMDeployWorker(RolloutWorker):
             extra_engine_config["max_prefill_token_num"] = self.config.max_prefill_token_num
         if backend == "pytorch" and self.config.enable_prefix_caching:
             extra_engine_config["enable_prefix_caching"] = True
+
+        if backend == "pytorch":
+            extra_engine_config.update(
+                prefill_save_alignment=self.config.prefill_save_alignment,
+                prefix_cache_state_budget=self.config.prefix_cache_state_budget,
+                prefix_cache_decode_save_first=self.config.prefix_cache_decode_save_first,
+                prefix_cache_decode_state_interval=self.config.prefix_cache_decode_state_interval,
+                prefill_save_last_only=self.config.prefill_save_last_only,
+            )
 
         assert self.server_launch_spec is not None
         dp_rank = 0

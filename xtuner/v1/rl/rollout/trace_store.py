@@ -77,8 +77,9 @@ def _assemble_trace(nodes: List["TreeNode"], session_id: str) -> dict:
 
     Returns:
         dict: The trace dictionary containing `input_ids`, `labels`,
-        `logprobs`, `routed_experts`, `tool_call_count`, `prompt_ids`, and
-        `response_ids`. ``tool_call_count`` is the summed per-turn tool-call
+        `logprobs`, `routed_experts`, `tool_call_count`, `token_model_steps`,
+        `prompt_ids`, and `response_ids`, plus `response_model_steps` and
+        `request_ids` when any node carries a request id. ``tool_call_count`` is the summed per-turn tool-call
         count of the assistant turns on the chain, or ``None`` when any
         assistant turn predates the ``tool_call_count`` field (legacy node).
         ``prompt_ids`` is the session's initial prompt segment and
@@ -89,6 +90,9 @@ def _assemble_trace(nodes: List["TreeNode"], session_id: str) -> dict:
     trace: dict[str, Any] = {"input_ids": [], "labels": [], "logprobs": []}
     expert_keys: List[Any] = []
     tool_call_counts: List[int | None] = []
+    response_model_steps: List[int | None] = []
+    token_model_steps: List[int | None] = []
+    request_ids: List[str] = []
     for node in nodes:
         node_val = node.value
         if not isinstance(node_val, TokenizedSegment):
@@ -104,8 +108,13 @@ def _assemble_trace(nodes: List["TreeNode"], session_id: str) -> dict:
         elif any(label != -100 for label in node_val.labels):
             # Assistant turn written before the field existed: count unknown.
             tool_call_counts.append(None)
+        response_model_steps.extend(node_val.model_step for label in node_val.labels if label != -100)
+        token_model_steps.extend([node_val.model_step] * len(node_val.token_ids))
+        if node_val.request_id is not None and node_val.request_id not in request_ids:
+            request_ids.append(node_val.request_id)
     trace["routed_experts"] = _resolve_routed_experts(expert_keys, session_id)
     trace["tool_call_count"] = None if None in tool_call_counts else sum(tool_call_counts)
+    trace["token_model_steps"] = token_model_steps
     # The first node holds the session's initial prompt segment (the only segment written
     # before any assistant turn), so everything after it is the contiguous response suffix
     # the training stack relies on (env/tool tokens included). A non-prompt head means the
@@ -125,6 +134,9 @@ def _assemble_trace(nodes: List["TreeNode"], session_id: str) -> dict:
         prompt_token_count = 0
         trace["prompt_ids"] = []
     trace["response_ids"] = list(trace["input_ids"][prompt_token_count:])
+    if request_ids:
+        trace["response_model_steps"] = response_model_steps
+        trace["request_ids"] = request_ids
     return trace
 
 
@@ -168,6 +180,8 @@ def _latest_chain(trie: "Trie") -> List["TreeNode"]:
 class TokenizedSegment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    request_id: str | None = None
+    model_step: int | None = None
     text: str
     token_ids: List[int]
     labels: List[int] | None = Field(default=None, repr=False)
@@ -247,6 +261,13 @@ class Trie:
                 node = node.children[key]
                 break
 
+        if node.value is not None and (
+            getattr(node.value, "request_id", None) is not None or getattr(value, "request_id", None) is not None
+        ):
+            raise ValueError(
+                f"Conflicting trace write: old_request_id={getattr(node.value, 'request_id', None)} "
+                f"new_request_id={getattr(value, 'request_id', None)}"
+            )
         node.written_at = time.time()
         node.value = value
 
@@ -505,6 +526,19 @@ class RolloutTraceStore:
                 "See the logged '[TraceStore] prompt mismatch' report for the full diff."
             )
         return _assemble_trace(nodes, session_id)
+
+    def contains_request_ids(self, session_id: str, request_ids: list[str]) -> bool:
+        """Validate transcript provenance across committed branches of one session."""
+        trie = self.sessions.get(session_id)
+        if trie is None:
+            return False
+        missing = set(request_ids)
+        stack = [trie.root]
+        while stack and missing:
+            node = stack.pop()
+            missing.discard(getattr(node.value, "request_id", None))
+            stack.extend(node.children.values())
+        return not missing
 
     def get_objects(self, keys: list[str]) -> list[ray.ObjectRef]:
         """Fetch ray.ObjectRef elements by their keys.

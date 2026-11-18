@@ -19,6 +19,7 @@ _RL_TEST_DIR = Path(__file__).resolve().parent
 _LIGHTWEIGHT_TEST_FILES = {
     "test_agent_loop_shutdown.py",
     "test_cpu_pg.py",
+    "test_colocate_keepalive.py",
     "test_multi_task_agent_loop_manager.py",
     "test_pending_tasks.py",
     "test_produce_progress.py",

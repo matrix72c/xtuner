@@ -64,6 +64,9 @@ class TestSandboxArtifactOwnership(unittest.IsolatedAsyncioTestCase):
         # __new__ bypasses __init__; provide the attributes _build_rollout_states touches.
         loop.train_on_timeout = False
         loop.timeout_reward = -1.0
+        loop.require_turn_provenance = False
+        loop.retire_route_on_completion = False
+        loop.min_valid_attempts = None
         loop.logger = MagicMock()
         loop.tokenizer = MagicMock()
         loop.tokenizer.apply_chat_template.side_effect = lambda messages, **_: f"rendered-{messages[-1]['content']}\n"

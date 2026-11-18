@@ -164,6 +164,7 @@ class BaseProduceContext:
         for item in rollout_state:
             item.extra_fields["producer_future_step"] = self.train_step
 
+        inherited_tokens = sum(len(item.response_ids or []) for item in rollout_state)
         start = time.perf_counter()
         if isinstance(self.agent_loop, ray.actor.ActorHandle):
             result = await self.agent_loop.generate_group.remote(
@@ -176,15 +177,24 @@ class BaseProduceContext:
                 enable_partial_rollout=enable_partial_rollout,
             )
         elapsed = time.perf_counter() - start
-        if isinstance(result, list):
-            for item in result:
-                if isinstance(item, RolloutState):
-                    item.extra_fields[GROUP_GENERATE_TIME_KEY] = elapsed
+        new_tokens = max(0, sum(len(item.response_ids or []) for item in result) - inherited_tokens)
+        for index, item in enumerate(result):
+            extra_fields = getattr(item, "extra_fields", None)
+            if extra_fields is None:
+                extra_fields = {}
+                setattr(item, "extra_fields", extra_fields)
+            extra_fields[GROUP_GENERATE_TIME_KEY] = elapsed
+            # Provenance may already cover every new token. Count generation
+            # separately, once per group, without mutating token versions.
+            extra_fields["new_response_tokens"] = new_tokens if index == 0 else 0
         return result
 
     async def put_generated_group(self, group: list[RolloutState]) -> bool:
         produced_tokens = sum(
-            max(0, len(item.response_ids or []) - len(item.response_model_steps or [])) for item in group
+            item.extra_fields.get(
+                "new_response_tokens", max(0, len(item.response_ids or []) - len(item.response_model_steps or []))
+            )
+            for item in group
         )
         initial_status = get_group_status(group)
 
@@ -725,7 +735,22 @@ class _PendingTasks:
 
     def __init__(self) -> None:
         self._tasks: set[asyncio.Task] = set()
+        self._groups: dict[asyncio.Task, list[RolloutState]] = {}
         self._lock = asyncio.Lock()
+        self._admission_closed = False
+
+    def close_admission(self) -> None:
+        """Permanently stop new groups on this owner's loop during shutdown.
+
+        Set before cancelling tasks: a still-running producer may observe the
+        emptied pending set while cancellation/trace cleanup yields control.
+        Normal keepalive windows never call this terminal operation.
+        """
+        self._admission_closed = True
+
+    def track_group(self, task: asyncio.Task, group: list[RolloutState]) -> None:
+        # Called by spawn_one under the scheduling lock, before task publication.
+        self._groups[task] = group
 
     def count(self) -> int:
         return len(self._tasks)
@@ -734,6 +759,8 @@ class _PendingTasks:
         async with self._lock:
             ready = {task for task in self._tasks if task.done()}
             self._tasks.difference_update(ready)
+            for task in ready:
+                self._groups.pop(task, None)
             return ready
 
     async def wait_and_claim(self, *, timeout_s: float) -> set[asyncio.Task]:
@@ -746,6 +773,8 @@ class _PendingTasks:
         async with self._lock:
             claimed = done & self._tasks
             self._tasks.difference_update(claimed)
+            for task in claimed:
+                self._groups.pop(task, None)
             return claimed
 
     async def schedule_one(
@@ -756,16 +785,36 @@ class _PendingTasks:
         spawn_one: Callable[[], Awaitable[asyncio.Task]],
     ) -> bool:
         async with self._lock:
-            if should_abort() or len(self._tasks) >= max_pending:
+            if self._admission_closed or should_abort() or len(self._tasks) >= max_pending:
                 return False
-            self._tasks.add(await spawn_one())
+            task = await spawn_one()
+            self._tasks.add(task)
+            if self._admission_closed:
+                # close may have run while the sampler yielded. The newly
+                # created task has not run yet; cancel it before first dispatch
+                # and keep it owned so cancel_all can drain it exactly once.
+                task.cancel()
+                return False
             return True
 
     async def _claim_all(self) -> set[asyncio.Task]:
         async with self._lock:
             claimed = set(self._tasks)
             self._tasks.clear()
+            for task in claimed:
+                self._groups.pop(task, None)
             return claimed
+
+    async def cancel_detached(self) -> tuple[set[asyncio.Task], list[list[RolloutState]]]:
+        """Transfer unselected tasks and their trace owners after certified pause."""
+        async with self._lock:
+            tasks = set(self._tasks)
+            self._tasks.clear()
+            groups = [self._groups.pop(task, []) for task in tasks]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        return tasks, groups
 
     async def cancel_all(self) -> int:
         tasks = await self._claim_all()
@@ -825,6 +874,14 @@ async def request_agent_loop_pause(ctx: BaseProduceContext, *, pending_count: in
             f"Agent loop pause failed: task={ctx.task_name}, "
             f"elapsed={time.perf_counter() - pause_request_start:.2f}s, pending={pending_count}"
         )
+
+
+async def retain_pending_tasks(*, pending_tasks, ctx, put_claimed_task) -> float:
+    """Claim completed groups once; live Agent tasks keep their original owner."""
+    start = time.perf_counter()
+    for task in await pending_tasks.claim_ready():
+        await put_claimed_task(task)
+    return time.perf_counter() - start
 
 
 async def pause_pending_tasks(

@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -134,6 +134,19 @@ class AgentLoopManagerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     tasks: list[TaskSpecConfig] | TaskSpecConfig
+    turn_keepalive: bool = False
+    turn_keepalive_update_policy: Literal["quiescent", "batch_ready"] = "quiescent"
+    turn_keepalive_checkpoint_mode: Literal["full", "model_export"] = "full"
+    turn_keepalive_freeze_timeout: float = Field(default=30, gt=0)
+    turn_keepalive_drain_timeout: float = Field(default=450, gt=0)
+    turn_keepalive_quiesce_timeout: float = Field(default=3600, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_batch_ready_policy(self):
+        if self.turn_keepalive_update_policy == "batch_ready":
+            if not self.turn_keepalive or self.turn_keepalive_checkpoint_mode != "model_export":
+                raise ValueError("batch_ready requires turn_keepalive and explicit model_export")
+        return self
 
     def build(
         self,
@@ -144,6 +157,15 @@ class AgentLoopManagerConfig(BaseModel):
         sync_weights_interval: int = 1,
         rollout_teacher_scorer_config: RolloutTeacherScorerConfig | None = None,
     ) -> AgentLoopManager:
+        if self.turn_keepalive:
+            from .colocate_keepalive import build_keepalive_manager
+
+            return build_keepalive_manager(
+                self, rollout_controller=rollout_controller, tokenizer=tokenizer,
+                replay_buffer=replay_buffer, logger=logger,
+                sync_weights_interval=sync_weights_interval,
+                rollout_teacher_scorer_config=rollout_teacher_scorer_config,
+            )
         tasks = self.tasks if isinstance(self.tasks, list) else [self.tasks]
         if not tasks:
             raise ValueError("AgentLoopManagerConfig requires at least one task config.")
@@ -231,7 +253,11 @@ class AgentLoopManager:
         train_step: int,
         *,
         model_step: int,
+        quiesce: bool = False,
+        final: bool = False,
     ) -> ProduceBatchResult:
+        if getattr(self, "_final_window", False):
+            raise RuntimeError("Cannot produce after final batch selection")
         # 共卡同步入口：生产入 buffer -> pause/drain 本轮 pending -> 取非空训练 batch。
         if batch_size <= 0:
             raise ValueError(f"produce_batch expects batch_size > 0, got {batch_size}")
@@ -243,8 +269,15 @@ class AgentLoopManager:
         active_tasks = [task for task in self.task_runners if current_sizes[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
-        await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
-        await asyncio.gather(*(call_agent_loop_hook(task.agent_loop, "resume") for task in active_tasks))
+        # Keepalive freezes live requests behind request gates, so agent-loop admission hooks only
+        # bracket the ordinary abort-based pause.
+        keepalive = getattr(self, "_keepalive", None)
+        if keepalive is None:
+            await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
+            await asyncio.gather(*(call_agent_loop_hook(task.agent_loop, "resume") for task in active_tasks))
+        else:
+            await keepalive.resume(self._rollout_controller, model_step)
+            await keepalive.check_requests(self._rollout_controller)
         local_progress = ProduceProgress.build(
             task_names=self.task_names,
             target_samples=current_sizes,
@@ -282,13 +315,43 @@ class AgentLoopManager:
         await asyncio.gather(*produce_futures)
         local_progress.add_produce_time(time.perf_counter() - produce_start)
 
+        # Checkpoint/final quiesce happens while gates are open. Never wait for
+        # an entire episode behind a sealed request gate.
+        if keepalive is not None:
+            if quiesce and getattr(self, "_update_policy", "quiescent") != "batch_ready":
+                self.logger.info(f"checkpoint_quiesce_begin step={train_step} pending="
+                                 f"{sum(t.produce_strategy._pending_tasks.count() for t in self.task_runners)}")
+                async def finish_live_tasks():
+                    for task in self.task_runners:
+                        ctx = ProduceContext(
+                            agent_loop=task.agent_loop, sampler=task.sampler,
+                            replay_buffer=self.replay_buffer, task_batch_size=0,
+                            task_name=task.task_name, train_step=train_step,
+                            model_step=model_step, progress=local_progress,
+                            stale_threshold=task.stale_threshold,
+                            token_stale_threshold=task.token_stale_threshold,
+                            expired_groups_retryable=task.expired_groups_retryable,
+                        )
+                        owner = task.produce_strategy._pending_tasks
+                        while owner.count():
+                            for ready in await owner.wait_and_claim(timeout_s=1):
+                                await ctx.put_generated_group(ready.result())
+                await asyncio.wait_for(finish_live_tasks(), keepalive.quiesce_timeout)
+        # Quiesce finishes episodes; only the pause itself counts as pause time.
         pause_start = time.perf_counter()
-        await asyncio.gather(*(call_agent_loop_hook(task.agent_loop, "prepare_pause") for task in active_tasks))
-        # pause 只收尾本轮本地 pending。
-        await self._rollout_controller.pause_generation.remote()  # type: ignore[attr-defined]
+        if keepalive is not None:
+            await keepalive.pause(self._rollout_controller)
+        else:
+            await asyncio.gather(*(call_agent_loop_hook(task.agent_loop, "prepare_pause") for task in active_tasks))
+            # pause 只收尾本轮本地 pending。
+            await self._rollout_controller.pause_generation.remote()  # type: ignore[attr-defined]
 
         for task in active_tasks:
             produce_strategy = cast(ProduceStrategy, task.produce_strategy)
+            if keepalive is not None:
+                # Live futures stay in the strategy's existing _PendingTasks.
+                # Done futures are harvested on the next window (or quiesce).
+                continue
             await produce_strategy.pause_produce(
                 ProduceContext(
                     agent_loop=task.agent_loop,
@@ -325,11 +388,56 @@ class AgentLoopManager:
         if window_metrics:
             result.custom_scalars = window_metrics
 
+        if getattr(self, "_update_policy", "quiescent") == "batch_ready":
+            if len(result.rollout_states) != sum(current_sizes.values()):
+                raise RuntimeError("Batch-ready update requires the full valid batch")
+            if final:
+                # pause() already sealed admission and certified GPU/trace drain.
+                # Claim before cancelling: late completions cannot reenter replay.
+                # Cleanup may continue during training, owned until close().
+                self._finalizing_tasks = getattr(self, "_finalizing_tasks", set())
+                for task in self.task_runners:
+                    tails, groups = await task.produce_strategy._pending_tasks.cancel_detached()
+                    self._finalizing_tasks.update(tails)
+                    self._finalizing_groups = getattr(self, "_finalizing_groups", []) + groups
+                self._final_window = True
+                self.logger.info(f"final_tail_cancelled count={len(self._finalizing_tasks)}")
+
         self.logger.info(
             f"[AgentLoopManager][{self.name}] produce_batch done "
             f"elapsed={time.perf_counter() - start:.3f}, completed_groups={len(result.rollout_states)}"
         )
         return result
+
+    async def release_final_leftovers(self) -> None:
+        if not getattr(self, "_final_window", False):
+            return
+        from xtuner.v1.rl.rollout.trace_store import release_and_discard_rollout_groups
+        groups = list(getattr(self, "_finalizing_groups", []))
+        # Result segments may be new objects. Include completed, unclaimed tails.
+        for future in getattr(self, "_finalizing_tasks", set()):
+            if not future.cancelled() and future.exception() is None:
+                groups.append(future.result())
+        for task in self.task_runners:
+            for status in Status:
+                count = await self.replay_buffer.count(task.task_name, status)
+                if count:
+                    groups.extend(await self.replay_buffer.get(count, task.task_name, status))
+        self._finalizing_groups = groups
+        sessions = sorted({str(item.session_id) for group in groups for item in group if item.session_id is not None})
+        self.logger.info(f"final_trace_cleanup sessions={sessions}")
+        await release_and_discard_rollout_groups([g for g in groups if g])
+        self._finalizing_groups = []
+
+    @property
+    def checkpoint_resumable(self) -> bool:
+        return getattr(self, "_checkpoint_mode", "full") == "full"
+
+    @staticmethod
+    def assert_resumable_checkpoint(checkpoint_path: Path | str) -> None:
+        state_path = manager_state_path(Path(checkpoint_path))
+        if state_path.exists() and json.loads(state_path.read_text()).get("resumable") is False:
+            raise RuntimeError("Model export cannot restore sampler/replay/live Agents; load weights explicitly")
 
     async def save(
         self,
@@ -341,6 +449,18 @@ class AgentLoopManager:
         """Save all task sampler states and the shared replay buffer."""
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
+        if getattr(self, "_checkpoint_mode", "full") == "model_export":
+            # A model export is intentionally NOT an Agent/sampler checkpoint.
+            # Never serialize a mutable replay snapshot or advertise cold resume.
+            state = {
+                "model_step": model_step, "checkpoint_mode": "model_export",
+                "resumable": False, "live_agents_restored": False,
+                "sampler_saved": False, "replay_buffer_saved": False,
+                "pending_task_counts": get_pending_task_counts(self.task_runners),
+            }
+            manager_state_path(checkpoint_path).write_text(json.dumps(state))
+            self.logger.info("Saving model export only; live Agents retained in memory, cold resume unavailable")
+            return
         pending_task_counts = get_pending_task_counts(self.task_runners)
         if pending_task_counts:
             raise RuntimeError(
@@ -369,12 +489,15 @@ class AgentLoopManager:
     async def resume(self, checkpoint_path: Path | str) -> int:
         """Resume all task sampler states and the shared replay buffer."""
         checkpoint_path = Path(checkpoint_path)
+        self.assert_resumable_checkpoint(checkpoint_path)
         for task in self.task_runners:
             task.sampler.resume(task_checkpoint_path(checkpoint_path, task.task_name))
 
         state_path = manager_state_path(checkpoint_path)
         with state_path.open("r") as f:
             manager_state = json.load(f)
+        if getattr(self, "_keepalive", None) is not None and not manager_state.get("replay_buffer_saved", True):
+            raise RuntimeError("Full colocate resume requires a persisted replay buffer")
         if manager_state.get("replay_buffer_saved", True):
             # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
             await self.replay_buffer.resume(checkpoint_path)

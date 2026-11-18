@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Literal
 
 from lagent.utils import create_object
+from pydantic import Field
 
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
 from xtuner.v1.rl.judger import Judger
@@ -49,11 +50,37 @@ def _resolve_runner(pipeline: Any, session_id: str) -> Any:
     return pipeline
 
 
-def _drop_failed_train_samples(samples: list[RolloutState], mode: Literal["train", "eval"]) -> list[RolloutState]:
+def _drop_failed_train_samples(
+    samples: list[RolloutState], mode: Literal["train", "eval"], min_valid_attempts: int | None = None
+) -> list[RolloutState]:
+    """Drop failed training attempts; optionally require independent survivors.
+
+    - mixed group: failed attempts dropped; remaining valid attempts train.
+    - fewer than min_valid_attempts valid independent attempts (distinct
+      agent_session_id): whole group marked FILTERED with a recorded reason,
+      so it never reaches replay/advantage/policy loss.
+    - all attempts failed: statuses kept as FAILED so the group is counted
+      and discarded as failed, not silently re-labelled.
+    """
     if mode != "train":
         return samples
     filtered = [sample for sample in samples if sample.status != Status.FAILED]
-    return filtered or samples
+    if len(filtered) == len(samples):
+        return samples
+    if not filtered:
+        return samples
+    if min_valid_attempts is None:
+        return filtered
+    valid_attempts = {sample.extra_fields.get("agent_session_id") for sample in filtered}
+    if len(valid_attempts) < min_valid_attempts:
+        for sample in samples:
+            sample.status = Status.FILTERED
+            sample.extra_fields["filter_reason"] = (
+                f"valid_independent_attempts<{min_valid_attempts} "
+                f"(valid={len(valid_attempts)}, dropped_failed={len(samples) - len(filtered)})"
+            )
+        return samples
+    return filtered
 
 
 def _validate_trace_segment(
@@ -206,6 +233,10 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
     timeout_reward: float = -1.0
     mode: Literal["train", "eval"] = "train"
     requires_rollout_proxy: bool = True
+    require_turn_provenance: bool = False
+    retire_route_on_completion: bool = False
+    # Optional recipe policy; ordinary sandbox filtering keeps upstream semantics.
+    min_valid_attempts: int | None = Field(default=None, ge=1)
 
     def build_local(
         self, rollout_controller: RolloutController | None = None, judger: Judger | None = None, logger=None
@@ -220,6 +251,9 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
             train_on_timeout=self.train_on_timeout,
             timeout_reward=self.timeout_reward,
             mode=self.mode,
+            require_turn_provenance=self.require_turn_provenance,
+            retire_route_on_completion=self.retire_route_on_completion,
+            min_valid_attempts=self.min_valid_attempts,
         )
 
 
@@ -235,6 +269,9 @@ class AgentInSandboxLoop(AgentLoop):
         train_on_timeout: bool = False,
         timeout_reward: float = -1.0,
         mode: Literal["train", "eval"] = "train",
+        require_turn_provenance: bool = False,
+        retire_route_on_completion: bool = False,
+        min_valid_attempts: int | None = None,
     ):
         if hf_checkpoint is None:
             raise ValueError("hf_checkpoint must be provided for AgentInSandboxLoop.")
@@ -246,6 +283,11 @@ class AgentInSandboxLoop(AgentLoop):
         self.mode = mode
         self._active_runs: set[asyncio.Task] = set()
         self._closing = False
+        self.require_turn_provenance = require_turn_provenance
+        self.retire_route_on_completion = retire_route_on_completion
+        if min_valid_attempts is not None and min_valid_attempts < 1:
+            raise ValueError("min_valid_attempts must be positive")
+        self.min_valid_attempts = min_valid_attempts
 
     async def generate_group(self, rollout_state: list[RolloutState], **kwargs) -> list[RolloutState]:
         async def generate_one(state: RolloutState) -> list[RolloutState]:
@@ -264,7 +306,7 @@ class AgentInSandboxLoop(AgentLoop):
         generated_samples = asyncio.gather(*pending_tasks)
         sample_groups = await generated_samples
         samples = [sample for sample_group in sample_groups for sample in sample_group]
-        samples = _drop_failed_train_samples(samples, self.mode)
+        samples = _drop_failed_train_samples(samples, self.mode, self.min_valid_attempts)
         samples = maybe_filter_invalid_sample(samples, self.is_valid_sample_fn, self.logger)
         samples = await self._teacher_scorer.on_group_ready(samples)
         return self.canonicalize_train_fields(samples)
@@ -301,6 +343,12 @@ class AgentInSandboxLoop(AgentLoop):
             rollout_state.error_msg = f"{type(exc).__name__}: {exc}"
             self.logger.error(f"[AgentInSandboxLoop] failed: {exc}\n{traceback.format_exc()}")
             return [rollout_state]
+        finally:
+            # This loop returns terminal Agent executions, never partial continuations.
+            # Retire HTTP ownership after runner completion/cancellation, independently
+            # of later filtering or replay consumption; keep trace ownership unchanged.
+            if self.retire_route_on_completion and self.rollout_ctl is not None and rollout_state.session_id is not None:
+                await self.rollout_ctl.retire_route_sessions.remote([str(rollout_state.session_id)])
 
     async def _run_item(self, item: AgentRolloutItem) -> AgentRolloutItem:
         if self._closing:
@@ -344,6 +392,7 @@ class AgentInSandboxLoop(AgentLoop):
         rollout_state.reward = _extract_reward_payload(item)
         rollout_state.extra_fields["origin_data_source"] = item.data_source
         rollout_state.extra_fields["agent_status"] = item.status.value
+        rollout_state.extra_fields["agent_sandbox_env_id"] = item.infer.sandbox_env_id
         selected_agent = _selected_agent(item)
         if selected_agent is not None:
             rollout_state.extra_fields["agent_name"] = selected_agent.get("name")
@@ -388,11 +437,11 @@ class AgentInSandboxLoop(AgentLoop):
             data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
             segment_state.input_ids = data["input_ids"]
             segment_state.labels = data["labels"]
-            # prompt_ids/response_ids both come from the trace: the session's initial prompt
-            # segment and the contiguous suffix after it (tool-result tokens included), so
-            # input_ids == prompt_ids + response_ids holds. Dataset-side prompt_ids is not used
-            # because agent requests render with system/tools.
+            # Unified response_ids convention: the contiguous suffix of input_ids after the prompt
+            # (env-injected tokens included), aligned with response_model_steps for per-token
+            # staleness; also the token count used by rollout throughput logging.
             segment_state.prompt_ids = list(data["prompt_ids"])
+            prompt_len = len(segment_state.prompt_ids)
             segment_state.response_ids = list(data["response_ids"])
             segment_state.logprobs = data["logprobs"]
             # ``routed_experts`` is a per-node list for a MoE trace or ``None`` for a dense one; trace_store's
@@ -402,6 +451,31 @@ class AgentInSandboxLoop(AgentLoop):
             # indistinguishable from a dense trace; catching that would need the MoE-vs-dense signal the loop lacks
             # (session_server gates on ``enable_return_routed_experts``).
             segment_state.routed_experts = data["routed_experts"]
+            if self.require_turn_provenance:
+                # main's response_ids is the full suffix, including tool/history
+                # positions. Versions must follow the same positions, not only
+                # the supervised labels. Preserve each original request's lease.
+                versions = data.get("token_model_steps", [])[prompt_len:]
+                if len(versions) != len(segment_state.response_ids) or any(v is None for v in versions):
+                    raise ValueError("Missing request-time response model versions")
+                if not data["routed_experts"]:
+                    raise ValueError("turn-resume MoE training requires routed experts on every node")
+                records = _load_messages_artifact(item.artifacts)
+                matching = [
+                    record for record in records if record.get("messages") == messages and record.get("tools") == tools
+                ]
+                recorded_ids = matching[0].get("request_ids", []) if len(matching) == 1 else []
+                path_ids = data.get("request_ids", [])
+                if (
+                    not recorded_ids
+                    or not path_ids
+                    or recorded_ids[-1] != path_ids[-1]
+                    or not set(path_ids).issubset(recorded_ids)
+                    or not await trace_store.contains_request_ids.remote(str(rollout_state.session_id), recorded_ids)
+                ):
+                    raise ValueError("Agent transcript request IDs do not match committed trace")
+                segment_state.response_model_steps = versions
+                segment_state.extra_fields["request_ids"] = data["request_ids"]
             if segment_state.response_ids:
                 segment_state.response = self.tokenizer.decode(segment_state.response_ids)
             else:

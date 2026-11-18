@@ -41,7 +41,11 @@ class TestLoopShutdown(unittest.IsolatedAsyncioTestCase):
                 worker.close = SimpleNamespace(remote=AsyncMock())
                 router = RouterAgentLoop([worker], MagicMock())
                 manager = manager_type.__new__(manager_type)
-                manager.task_runners = [SimpleNamespace(agent_loop=loop) for loop in (local, actor, router)]
+                manager.shutdown = MagicMock()
+                manager.task_runners = [
+                    SimpleNamespace(agent_loop=loop, produce_strategy=SimpleNamespace(close=AsyncMock()))
+                    for loop in (local, actor, router)
+                ]
                 with self.assertRaises(RuntimeError) as caught:
                     await manager.close()
                 self.assertIs(caught.exception, failure)
@@ -107,6 +111,7 @@ class TestTrainerShutdown(unittest.TestCase):
                         trainer = trainer_type.__new__(trainer_type)
                         trainer.logger = MagicMock()
                         trainer._enable_evaluate = True
+                        trainer._debug_train = False
                         trainer.agent_loop_manager = SimpleNamespace(
                             close=AsyncMock(side_effect=RuntimeError("cleanup failed") if cleanup_fails else None)
                         )
@@ -140,6 +145,7 @@ class TestTrainerShutdown(unittest.TestCase):
                     trainer = trainer_type.__new__(trainer_type)
                     trainer.logger = MagicMock()
                     trainer._enable_evaluate = True
+                    trainer._debug_train = False
                     trainer.agent_loop_manager = SimpleNamespace(close=AsyncMock())
                     trainer.eval_agent_loop_manager = SimpleNamespace(close=AsyncMock(side_effect=failure))
                     trainer.rl_health_manager = MagicMock()
@@ -164,6 +170,7 @@ class TestTrainerShutdown(unittest.TestCase):
         trainer._fit = AsyncMock()
         trainer._exp_tracker = MagicMock()
         trainer._enable_evaluate = False
+        trainer._debug_train = False
         trainer.agent_loop_manager = SimpleNamespace(close=AsyncMock())
         with patch("xtuner.v1.train.rl_trainer.close_trace"):
             trainer.fit()
