@@ -114,7 +114,8 @@ class RequestGate:
                 raise RuntimeError("Unknown or still-running requests prevent recovery")
             for request_id in request_ids:
                 self._active[request_id].settlement = SettlementReceipt(
-                    True, True, "failed_after_confirmed_backend_sleep")
+                    True, True, "failed_after_confirmed_backend_sleep"
+                )
                 del self._active[request_id]
                 del self._failures[request_id]
             self._condition.notify_all()

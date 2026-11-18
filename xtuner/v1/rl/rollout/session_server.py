@@ -324,7 +324,8 @@ class SessionServer:
         self.turn_resume_initially_closed = turn_resume_initially_closed
         self.request_gate = (
             RequestGate(wait_timeout=turn_resume_wait_timeout, initially_open=not turn_resume_initially_closed)
-            if turn_resume_wait_timeout is not None else None
+            if turn_resume_wait_timeout is not None
+            else None
         )
         self.store = get_store()
         self.stop_word = self.tokenizer.eos_token or ""
@@ -781,7 +782,9 @@ class SessionServer:
             trace_configs.append(trace)
         try:
             timeout = ClientTimeout(total=self.request_timeout, sock_connect=30)
-            async with ClientSession(read_bufsize=self.read_bufsize, timeout=timeout, trace_configs=trace_configs) as client:
+            async with ClientSession(
+                read_bufsize=self.read_bufsize, timeout=timeout, trace_configs=trace_configs
+            ) as client:
                 async with client.request(
                     method=request.method, url=target_url, headers=forward_headers, data=request_body
                 ) as resp:
@@ -888,9 +891,11 @@ class SessionServer:
                 if not hasattr(self, "_forward_timeouts"):
                     self._forward_timeouts = {}
                 self._forward_timeouts[lease.request_id] = dict(
-                    session_id=lease.session_id, epoch=lease.epoch,
+                    session_id=lease.session_id,
+                    epoch=lease.epoch,
                     headers_sent=headers_may_have_been_sent,
-                    error_type=type(exc).__name__, forwarding_exited=True,
+                    error_type=type(exc).__name__,
+                    forwarding_exited=True,
                 )
             raise
 
@@ -954,7 +959,9 @@ class SessionServer:
                 upstream_status, raw_response
             )
             backend_ended = complete or rejected_before_generation
-            get_logger().info(f"request_terminal id={lease.request_id} outcome={terminal} backend_ended={backend_ended}")
+            get_logger().info(
+                f"request_terminal id={lease.request_id} outcome={terminal} backend_ended={backend_ended}"
+            )
             if rejected_before_generation:
                 get_logger().info(
                     f"request_rejected_before_generation id={lease.request_id} reason=context_length_exceeded"
@@ -966,6 +973,8 @@ class SessionServer:
             )
             lease.settlement = SettlementReceipt(backend_ended, True, terminal)
             if terminal == "trace_committed":
+                # Only non-streaming responses can commit a trace.
+                assert isinstance(response, web.Response) and isinstance(response.body, bytes)
                 payload = json.loads(response.body)
                 payload["id"] = lease.request_id
                 response.body = json.dumps(payload).encode("utf-8")
@@ -1358,12 +1367,17 @@ class SessionServerActor:
 
     async def settle_after_backend_sleep(self, epoch: int, receipt: dict):
         import asyncio
+
         from .trace_store import get_existing_store
-        if (self.server is None or receipt.get("epoch") != epoch
-                or receipt.get("backend_url") != self.worker_base_url
-                or receipt.get("level") != 2
-                or receipt.get("native_sleep_returned") is not True
-                or receipt.get("is_sleeping") is not True):
+
+        if (
+            self.server is None
+            or receipt.get("epoch") != epoch
+            or receipt.get("backend_url") != self.worker_base_url
+            or receipt.get("level") != 2
+            or receipt.get("native_sleep_returned") is not True
+            or receipt.get("is_sleeping") is not True
+        ):
             raise RuntimeError("Missing or mismatched native backend sleep receipt")
         gate = self._gate()
         # Native sleep aborts running requests and fences queued old work by
@@ -1396,10 +1410,13 @@ class SessionServerActor:
                 raise RuntimeError("Failed Agent trace resources remain live")
         terminals = getattr(self.server, "_recovery_terminals", {})
         for request_id in ids:
-            terminals[request_id] = dict(outcome="failed_after_backend_sleep",
-                                        session_id=known[request_id]["session_id"],
-                                        barrier_epoch=epoch, reward_valid=False)
-        self.server._recovery_terminals = terminals
+            terminals[request_id] = dict(
+                outcome="failed_after_backend_sleep",
+                session_id=known[request_id]["session_id"],
+                barrier_epoch=epoch,
+                reward_valid=False,
+            )
+        setattr(self.server, "_recovery_terminals", terminals)
         result = await gate.settle_after_backend_sleep(epoch, ids)
         for request_id in ids:
             del known[request_id]

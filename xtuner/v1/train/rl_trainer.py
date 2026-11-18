@@ -471,7 +471,9 @@ class RLColocateTrainerConfig(BaseRLTrainerConfig):
             if self.auto_resume and self.load_checkpoint_cfg.checkpoint_path is not None:
                 raise ValueError("Choose explicit checkpoint_path or auto_resume, not both")
             if self.load_checkpoint_cfg.checkpoint_path is not None or self.auto_resume:
-                if not (self.load_checkpoint_cfg.load_optimizer_states and self.load_checkpoint_cfg.load_optimizer_args):
+                if not (
+                    self.load_checkpoint_cfg.load_optimizer_states and self.load_checkpoint_cfg.load_optimizer_args
+                ):
                     raise ValueError("Full colocate resume requires optimizer states")
         return self
 
@@ -1817,9 +1819,15 @@ class RLColocateTrainer(BaseRLTrainer):
                                 self.train_batch_size,
                                 train_step=train_step,
                                 model_step=model_step,
-                                **({"quiesce": self._checkpoint_due(train_step) or train_step == self._total_train_steps,
-                                    "final": train_step == self._total_train_steps}
-                                   if self._turn_keepalive else {}),
+                                **(
+                                    {
+                                        "quiesce": self._checkpoint_due(train_step)
+                                        or train_step == self._total_train_steps,
+                                        "final": train_step == self._total_train_steps,
+                                    }
+                                    if self._turn_keepalive
+                                    else {}
+                                ),
                             )
                         )
                 finally:
@@ -1961,6 +1969,7 @@ class RLDisaggregatedTrainer(BaseRLTrainer):
                 self._train_pg, advantage_estimator=self._advantage_estimator, distillation=self._distillation
             )
         if self._debug_train:
+            assert self._debug_rollout_dir is not None
             self.tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_path, trust_remote_code=True)
             self._debug_train_files = self._list_debug_rollout_files(self._debug_rollout_dir)
             if cfg.total_train_steps is None:

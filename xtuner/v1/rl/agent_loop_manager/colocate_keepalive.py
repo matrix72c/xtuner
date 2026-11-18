@@ -77,16 +77,22 @@ class ColocateKeepaliveManager:
             finalizing = getattr(self._inner, "_finalizing_tasks", set())
             cancellations = getattr(self, "_cleanup_waiters", None)
             if cancellations is None:
-                cancellations = [asyncio.create_task(task.produce_strategy._pending_tasks.cancel_all(),
-                                                    name=f"cleanup:{task.task_name}")
-                                 for task in self._inner.task_runners]
+                cancellations = [
+                    asyncio.create_task(
+                        task.produce_strategy._pending_tasks.cancel_all(), name=f"cleanup:{task.task_name}"
+                    )
+                    for task in self._inner.task_runners
+                ]
                 self._cleanup_waiters = cancellations
             owned = set(finalizing) | set(cancellations)
             pending = set()
             if owned:
                 done, pending = await asyncio.wait(owned, timeout=120)
-                errors.extend(f"{t.get_name()}: {t.exception()!r}" for t in done
-                              if not t.cancelled() and t.exception() is not None)
+                errors.extend(
+                    f"{t.get_name()}: {t.exception()!r}"
+                    for t in done
+                    if not t.cancelled() and t.exception() is not None
+                )
             if pending:
                 # Do not stop this loop or cancel an already-running finally a
                 # second time: platform cleanup must keep its original owner.
@@ -105,8 +111,11 @@ class ColocateKeepaliveManager:
                 task.cancel()
             if remaining:
                 done, pending = await asyncio.wait(remaining, timeout=30)
-                errors.extend(f"{t.get_name()}: {t.exception()!r}" for t in done
-                              if not t.cancelled() and t.exception() is not None)
+                errors.extend(
+                    f"{t.get_name()}: {t.exception()!r}"
+                    for t in done
+                    if not t.cancelled() and t.exception() is not None
+                )
             return errors, [t.get_name() for t in pending]
 
         errors, pending = await self._owner.call(cleanup())

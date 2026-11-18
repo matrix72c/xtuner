@@ -536,7 +536,9 @@ class RolloutTraceStore:
         stack = [trie.root]
         while stack and missing:
             node = stack.pop()
-            missing.discard(getattr(node.value, "request_id", None))
+            request_id = getattr(node.value, "request_id", None)
+            if request_id is not None:
+                missing.discard(request_id)
             stack.extend(node.children.values())
         return not missing
 

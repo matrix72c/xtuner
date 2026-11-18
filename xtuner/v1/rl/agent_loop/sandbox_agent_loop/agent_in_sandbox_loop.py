@@ -6,7 +6,7 @@ import importlib
 import json
 import traceback
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from lagent.utils import create_object
 from pydantic import Field
@@ -347,8 +347,12 @@ class AgentInSandboxLoop(AgentLoop):
             # This loop returns terminal Agent executions, never partial continuations.
             # Retire HTTP ownership after runner completion/cancellation, independently
             # of later filtering or replay consumption; keep trace ownership unchanged.
-            if self.retire_route_on_completion and self.rollout_ctl is not None and rollout_state.session_id is not None:
-                await self.rollout_ctl.retire_route_sessions.remote([str(rollout_state.session_id)])
+            if (
+                self.retire_route_on_completion
+                and self.rollout_ctl is not None
+                and rollout_state.session_id is not None
+            ):
+                await cast(Any, self.rollout_ctl.retire_route_sessions).remote([str(rollout_state.session_id)])
 
     async def _run_item(self, item: AgentRolloutItem) -> AgentRolloutItem:
         if self._closing:
@@ -460,7 +464,7 @@ class AgentInSandboxLoop(AgentLoop):
                     raise ValueError("Missing request-time response model versions")
                 if not data["routed_experts"]:
                     raise ValueError("turn-resume MoE training requires routed experts on every node")
-                records = _load_messages_artifact(item.artifacts)
+                records = cast(list[dict[str, Any]], _load_messages_artifact(item.artifacts))
                 matching = [
                     record for record in records if record.get("messages") == messages and record.get("tools") == tools
                 ]

@@ -243,8 +243,7 @@ class LMDeployWorker(RolloutWorker):
         if response.json().get("is_sleeping") is not True:
             raise RuntimeError("Backend did not confirm sleeping state")
         self._timeout_recovery_sleep = True
-        return dict(epoch=epoch, backend_url=self.server_url,
-                    level=2, native_sleep_returned=True, is_sleeping=True)
+        return dict(epoch=epoch, backend_url=self.server_url, level=2, native_sleep_returned=True, is_sleeping=True)
 
     def onload_weights(self):
         """Onloads the model weights by waking up the model."""

@@ -161,8 +161,11 @@ class AgentLoopManagerConfig(BaseModel):
             from .colocate_keepalive import build_keepalive_manager
 
             return build_keepalive_manager(
-                self, rollout_controller=rollout_controller, tokenizer=tokenizer,
-                replay_buffer=replay_buffer, logger=logger,
+                self,
+                rollout_controller=rollout_controller,
+                tokenizer=tokenizer,
+                replay_buffer=replay_buffer,
+                logger=logger,
                 sync_weights_interval=sync_weights_interval,
                 rollout_teacher_scorer_config=rollout_teacher_scorer_config,
             )
@@ -319,15 +322,22 @@ class AgentLoopManager:
         # an entire episode behind a sealed request gate.
         if keepalive is not None:
             if quiesce and getattr(self, "_update_policy", "quiescent") != "batch_ready":
-                self.logger.info(f"checkpoint_quiesce_begin step={train_step} pending="
-                                 f"{sum(t.produce_strategy._pending_tasks.count() for t in self.task_runners)}")
+                self.logger.info(
+                    f"checkpoint_quiesce_begin step={train_step} pending="
+                    f"{sum(t.produce_strategy._pending_tasks.count() for t in self.task_runners)}"
+                )
+
                 async def finish_live_tasks():
                     for task in self.task_runners:
                         ctx = ProduceContext(
-                            agent_loop=task.agent_loop, sampler=task.sampler,
-                            replay_buffer=self.replay_buffer, task_batch_size=0,
-                            task_name=task.task_name, train_step=train_step,
-                            model_step=model_step, progress=local_progress,
+                            agent_loop=task.agent_loop,
+                            sampler=task.sampler,
+                            replay_buffer=self.replay_buffer,
+                            task_batch_size=0,
+                            task_name=task.task_name,
+                            train_step=train_step,
+                            model_step=model_step,
+                            progress=local_progress,
                             stale_threshold=task.stale_threshold,
                             token_stale_threshold=task.token_stale_threshold,
                             expired_groups_retryable=task.expired_groups_retryable,
@@ -336,6 +346,7 @@ class AgentLoopManager:
                         while owner.count():
                             for ready in await owner.wait_and_claim(timeout_s=1):
                                 await ctx.put_generated_group(ready.result())
+
                 await asyncio.wait_for(finish_live_tasks(), keepalive.quiesce_timeout)
         # Quiesce finishes episodes; only the pause itself counts as pause time.
         pause_start = time.perf_counter()
@@ -395,7 +406,7 @@ class AgentLoopManager:
                 # pause() already sealed admission and certified GPU/trace drain.
                 # Claim before cancelling: late completions cannot reenter replay.
                 # Cleanup may continue during training, owned until close().
-                self._finalizing_tasks = getattr(self, "_finalizing_tasks", set())
+                self._finalizing_tasks: set[asyncio.Task] = getattr(self, "_finalizing_tasks", set())
                 for task in self.task_runners:
                     tails, groups = await task.produce_strategy._pending_tasks.cancel_detached()
                     self._finalizing_tasks.update(tails)
@@ -413,6 +424,7 @@ class AgentLoopManager:
         if not getattr(self, "_final_window", False):
             return
         from xtuner.v1.rl.rollout.trace_store import release_and_discard_rollout_groups
+
         groups = list(getattr(self, "_finalizing_groups", []))
         # Result segments may be new objects. Include completed, unclaimed tails.
         for future in getattr(self, "_finalizing_tasks", set()):
@@ -453,9 +465,12 @@ class AgentLoopManager:
             # A model export is intentionally NOT an Agent/sampler checkpoint.
             # Never serialize a mutable replay snapshot or advertise cold resume.
             state = {
-                "model_step": model_step, "checkpoint_mode": "model_export",
-                "resumable": False, "live_agents_restored": False,
-                "sampler_saved": False, "replay_buffer_saved": False,
+                "model_step": model_step,
+                "checkpoint_mode": "model_export",
+                "resumable": False,
+                "live_agents_restored": False,
+                "sampler_saved": False,
+                "replay_buffer_saved": False,
                 "pending_task_counts": get_pending_task_counts(self.task_runners),
             }
             manager_state_path(checkpoint_path).write_text(json.dumps(state))

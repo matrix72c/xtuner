@@ -374,8 +374,8 @@ class DetachedShellEntry:
         self.rc_poll_interval_sec = rc_poll_interval_sec
         self.output_wait_timeout_sec = output_wait_timeout_sec
         self.output_poll_interval_sec = output_poll_interval_sec
-        if not 0 <= pid_check_recovery_timeout_sec < float('inf'):
-            raise ValueError('pid_check_recovery_timeout_sec must be finite and nonnegative')
+        if not 0 <= pid_check_recovery_timeout_sec < float("inf"):
+            raise ValueError("pid_check_recovery_timeout_sec must be finite and nonnegative")
         self.pid_check_recovery_timeout_sec = pid_check_recovery_timeout_sec
 
     async def run(
@@ -460,18 +460,27 @@ class DetachedShellEntry:
     ) -> EntryOutcome:
         if self.pid_check_recovery_timeout_sec > 0:
             from .process_monitor import observe_process
+
             reason, rc, details = await observe_process(
-                client, pid=pid, timeout=self.timeout,
+                client,
+                pid=pid,
+                timeout=self.timeout,
                 recovery_timeout=self.pid_check_recovery_timeout_sec,
                 poll_interval=self.poll_interval_sec,
                 retry_interval=self.pid_check_retry_interval_sec,
                 rc_wait_timeout=self.rc_wait_timeout_sec,
                 rc_poll_interval=self.rc_poll_interval_sec,
-                read_rc=lambda: self._read_int_capture_file(client, entry.rc_file))
+                read_rc=lambda: self._read_int_capture_file(client, entry.rc_file),
+            )
             if rc is not None:
-                return _entry_completed_outcome(source='detach_exec', return_code=rc, details=details)
-            return EntryOutcome(source='detach_exec', reason=reason, retryable=True,
-                                details=details, result=StageResult(return_code=None, error=reason))
+                return _entry_completed_outcome(source="detach_exec", return_code=rc, details=details)
+            return EntryOutcome(
+                source="detach_exec",
+                reason=reason,
+                retryable=True,
+                details=details,
+                result=StageResult(return_code=None, error=reason),
+            )
         is_pid_running = client.is_pid_running
         deadline = time.monotonic() + self.timeout
         poll = max(0.2, self.poll_interval_sec)
