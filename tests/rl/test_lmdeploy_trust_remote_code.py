@@ -71,3 +71,41 @@ def test_trust_remote_code_override_wins_both_ways(tmp_path):
     opt_in = _server_config(tmp_path, with_auto_map=False, extra={"lmdeploy_trust_remote_code": True})
     assert opt_out.trust_remote_code is False
     assert opt_in.trust_remote_code is True
+
+
+class _EngineConfigCaptured(Exception):
+    pass
+
+
+def _pytorch_engine_kwargs(tmp_path: Path, monkeypatch, **config) -> dict:
+    import lmdeploy.messages
+
+    captured: dict = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        raise _EngineConfigCaptured
+
+    monkeypatch.setattr(lmdeploy.messages, "PytorchEngineConfig", capture)
+    worker = LMDeployWorker.__new__(LMDeployWorker)
+    worker.config = RolloutConfig(
+        model_path=_write_tokenizer_config(tmp_path / "stock", with_auto_map=False), context_length=128, **config
+    )
+    worker.accelerator = "GPU"
+    worker.server_launch_spec = _StubLaunchSpec()
+    with pytest.raises(_EngineConfigCaptured):
+        worker._transform_rollout_config_to_server_configs()
+    return captured
+
+
+def test_unset_ssm_prefix_settings_are_not_forwarded(tmp_path, monkeypatch):
+    # LMDeploy builds without one of these fields reject it as an unexpected keyword.
+    kwargs = _pytorch_engine_kwargs(tmp_path, monkeypatch)
+    assert not {"prefill_save_alignment", "prefix_cache_decode_save_first"} & kwargs.keys()
+
+
+def test_explicit_ssm_prefix_settings_are_forwarded(tmp_path, monkeypatch):
+    kwargs = _pytorch_engine_kwargs(tmp_path, monkeypatch, prefill_save_alignment=2048, prefill_save_last_only=False)
+    assert kwargs["prefill_save_alignment"] == 2048
+    assert kwargs["prefill_save_last_only"] is False
+    assert "prefix_cache_state_budget" not in kwargs

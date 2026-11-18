@@ -35,6 +35,13 @@ def _model_dir_declares_custom_code(model_path: str | Path) -> bool:
 
 SHARED_STORE = "shared_store"
 SHARED_STORE_NAMESPACE = "lmdeploy"
+_SSM_PREFIX_FIELDS = (
+    "prefill_save_alignment",
+    "prefix_cache_state_budget",
+    "prefix_cache_decode_save_first",
+    "prefix_cache_decode_state_interval",
+    "prefill_save_last_only",
+)
 
 
 def run_lmdeploy_server_wrapper(lmdeploy_config_namespace: Namespace):
@@ -448,12 +455,14 @@ class LMDeployWorker(RolloutWorker):
             extra_engine_config["enable_prefix_caching"] = True
 
         if backend == "pytorch":
+            # Forward only the SSM checkpoint settings a config sets, so LMDeploy builds that
+            # predate one of them still start and keep their own defaults.
             extra_engine_config.update(
-                prefill_save_alignment=self.config.prefill_save_alignment,
-                prefix_cache_state_budget=self.config.prefix_cache_state_budget,
-                prefix_cache_decode_save_first=self.config.prefix_cache_decode_save_first,
-                prefix_cache_decode_state_interval=self.config.prefix_cache_decode_state_interval,
-                prefill_save_last_only=self.config.prefill_save_last_only,
+                {
+                    name: getattr(self.config, name)
+                    for name in _SSM_PREFIX_FIELDS
+                    if name in self.config.model_fields_set
+                }
             )
 
         assert self.server_launch_spec is not None
