@@ -22,8 +22,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
-from torch.distributed.tensor.placement_types import Placement, _StridedShard
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor.placement_types import Placement, _StridedShard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from xtuner.v1.utils.dtensor import (
@@ -44,7 +44,6 @@ def _strided_shard() -> Placement:
 
 def _strided_dtensor(mesh: DeviceMesh, local: torch.Tensor, shape: tuple[int, ...]) -> DTensor:
     return DTensor.from_local(local, mesh, (_strided_shard(),), run_check=False, shape=shape, stride=(shape[1], 1))
-
 
 
 @pytest.fixture
@@ -103,7 +102,6 @@ class TestIsEvenlyDistributed:
         # 3 不能被 mesh 的 2 个 rank 整除；若 _StridedShard 被漏判，会错误地返回 True。
         assert not is_evenly_distributed(_strided_dtensor(fake_mesh, torch.randn(2, 8), (3, 8)))
         assert is_evenly_distributed(_strided_dtensor(fake_mesh, torch.randn(2, 8), (4, 8)))
-
 
 
 class TestDTensorCheckpointView:
