@@ -359,6 +359,32 @@ class AutoAcceleratorWorkers:
             raise ValueError(f"Unsupported accelerator architecture: {accelerator}")
 
     @staticmethod
+    def sort_bundles(node_accelerator_infos: Dict[str, Dict[int, int]], head_node_id: str | None = None) -> List[int]:
+        """Order bundles node by node and, within a node, by local
+        accelerator, with the driver's node first.
+
+        Rank 0 is the rendezvous master of every group built on these ranks,
+        and the driver's node is the one whose address the launcher already
+        knows; putting it first lets that address serve without asking where
+        rank 0 landed. The other nodes keep the order the placement group
+        reports them in.
+
+        Args:
+            node_accelerator_infos (Dict[str, Dict[int, int]]): For each node
+                id, the bundle index of each local accelerator id.
+            head_node_id (str | None): The node to order first. ``None`` or a
+                node holding no bundle leaves the order unchanged.
+
+        Returns:
+            List[int]: The bundle indices in rank order.
+        """
+        nodes = list(node_accelerator_infos)
+        if head_node_id in node_accelerator_infos:
+            nodes.remove(head_node_id)
+            nodes.insert(0, head_node_id)
+        return [node_accelerator_infos[node][rank] for node in nodes for rank in sorted(node_accelerator_infos[node])]
+
+    @staticmethod
     def get_spmd_info(pg: PlacementGroup) -> Tuple[List[int], str, int, int]:
         """Get SPMD (Single Program, Multiple Data) info from the placement
         group.
@@ -373,7 +399,7 @@ class AutoAcceleratorWorkers:
         Returns:
             Tuple[List[int], str, int, int]: A tuple containing:
                 - sorted_bundle_idxs (List[int]): The bundle indices sorted by
-                  node and local rank.
+                  node, the driver's node first, and local rank.
                 - master_addr (str): The address of the master worker (rank 0).
                 - master_port (int): The port for distributed communication.
                 - world_size (int): The total number of workers.
@@ -405,11 +431,9 @@ class AutoAcceleratorWorkers:
                 node_accelerator_infos[node_id] = {}
             node_accelerator_infos[node_id][local_rank] = bundle_idx
 
-        sorted_bundle_idxs = []
-        for node_id, infos in node_accelerator_infos.items():
-            for rank in sorted(infos.keys()):
-                bundle_idx = infos[rank]
-                sorted_bundle_idxs.append(bundle_idx)
+        sorted_bundle_idxs = AutoAcceleratorWorkers.sort_bundles(
+            node_accelerator_infos, head_node_id=ray.get_runtime_context().get_node_id()
+        )
 
         master_addr, master_port = ray.get(
             find_master_addr_and_port.options(
